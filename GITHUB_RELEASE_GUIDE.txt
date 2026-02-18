@@ -1,0 +1,135 @@
+# GitHub Release Checklist
+# BOM Analyzer Web — crdvtools
+# Prepared for: Norman Emmanuel D. Cordova, IPC CID
+# ─────────────────────────────────────────────────────────────────────────────
+
+STEP 1 — CREATE THE GITHUB REPOSITORY
+─────────────────────────────────────
+1. Go to https://github.com/crdvtools
+2. Click the green "New" button (or + icon top right → "New repository")
+3. Fill in:
+     Repository name:  bom-analyzer-web
+     Description:      Open-source PCB BOM supply chain optimizer with AI insights
+     Visibility:       ✅ Public (required for open source + free Streamlit hosting)
+     Initialize:       ✅ Check "Add a README file" (we will replace it)
+     Add .gitignore:   Python
+     License:          ← Select "MIT License" (GitHub will generate a basic one,
+                         but we will replace it with our custom version below)
+4. Click "Create repository"
+
+
+STEP 2 — UPLOAD YOUR FILES
+───────────────────────────
+You have 5 files to upload:
+
+  app.py               ← Main application (the Streamlit web app)
+  requirements.txt     ← Python dependencies
+  README.md            ← This professional README (replace the generated one)
+  LICENSE              ← MIT License with proper attribution (replace generated)
+  CONTRIBUTING.md      ← Contributor guidelines
+  .streamlit/
+    config.toml        ← Theme config (must be inside a folder named .streamlit)
+
+To upload:
+1. In your new repository, click "uploading an existing file" (or "Add file" → "Upload files")
+2. Drag and drop all files above
+3. For config.toml: GitHub file upload does NOT support nested folders well.
+   Use this method instead:
+   a. Click "Add file" → "Create new file"
+   b. In the Name field, type:  .streamlit/config.toml
+   c. Paste the contents of config.toml into the editor
+   d. Click "Commit new file"
+4. For the README.md and LICENSE: overwrite the auto-generated versions
+
+Commit message suggestion:
+  "Initial release: BOM Analyzer Web v1.0.0"
+
+
+STEP 3 — CREATE A RELEASE TAG
+──────────────────────────────
+1. In your repository, click "Releases" (right sidebar) → "Create a new release"
+2. Click "Choose a tag" → type:  v1.0.0  → click "Create new tag: v1.0.0"
+3. Release title:   BOM Analyzer Web v1.0.0
+4. Description:
+   ─────────────────────────────────────────────────
+   ## 🎉 Initial Release
+
+   Web-based PCB BOM supply chain analyzer — Streamlit conversion of Tyler Allen's
+   desktop BOM Analyzer with free Groq AI integration.
+
+   **What's included:**
+   - Live pricing & stock from Mouser and Nexar/Octopart APIs
+   - 5-factor risk scoring (Sourcing, Stock, Lead Time, Lifecycle, Geographic)
+   - 4 purchasing strategies with full CSV export
+   - AI executive summary powered by Groq (free, no credit card)
+   - One-click deploy to Streamlit Community Cloud
+
+   **Initiated by:** Norman Emmanuel D. Cordova, IPC Certified Interconnect Designer (CID)
+   **Original desktop app by:** Tyler Allen — github.com/ctylerallen/BOM_Analyzer
+   ─────────────────────────────────────────────────
+5. Click "Publish release"
+
+
+STEP 4 — DEPLOY ON STREAMLIT (FREE HOSTING)
+────────────────────────────────────────────
+1. Go to https://share.streamlit.io
+2. Sign in with your GitHub account
+3. Click "New app"
+4. Select:
+     Repository:  crdvtools/bom-analyzer-web
+     Branch:      main
+     Main file:   app.py
+5. Click "Deploy!"
+6. Your app will be live at a URL like:
+     https://crdvtools-bom-analyzer-web-app-xxxxxx.streamlit.app
+7. Share this URL with your PCB team
+
+
+STEP 5 — RECOMMENDED REPOSITORY SETTINGS
+──────────────────────────────────────────
+In your repo, go to Settings:
+
+• About (top right gear icon on repo home):
+    Description:  Open-source PCB BOM supply chain optimizer with AI insights
+    Website:      [paste your Streamlit URL once deployed]
+    Topics:       pcb, bom, supply-chain, streamlit, electronics, procurement,
+                  python, open-source, mouser, octopart
+
+• Issues: Enable (allows community bug reports)
+• Discussions: Enable (allows feature requests and Q&A)
+• Wiki: Optional
+
+
+STEP 6 — ADD A REPOSITORY BANNER (OPTIONAL BUT RECOMMENDED)
+─────────────────────────────────────────────────────────────
+Consider adding a screenshot of the app to the README.
+After deploying on Streamlit:
+1. Take a screenshot of the dashboard showing results
+2. Save it as docs/screenshot.png or similar
+3. Add to your repo and reference it in README.md:
+   ![BOM Analyzer Screenshot](docs/screenshot.png)
+
+
+─────────────────────────────────────────────────────────────────────────────
+LICENSE CHOICE RATIONALE — WHY MIT?
+─────────────────────────────────────────────────────────────────────────────
+
+MIT License was chosen because:
+
+✅ It's the most widely used open source license (#1 by usage in 2024)
+✅ It matches the license used by the original BOM Analyzer desktop app
+   (Tyler Allen's work), ensuring license compatibility for our derivative work
+✅ It allows anyone (individuals, companies, other teams) to freely use,
+   modify, and redistribute the tool — maximizing adoption in the PCB community
+✅ It has no "copyleft" requirement — teams can use this in commercial settings
+   without being required to open-source their internal BOMs or configurations
+✅ Simple and clear — only 3 paragraphs, recognized worldwide
+
+AGPL-3.0 was considered but rejected because it would require any organization
+running this as a web service to publish their own source code — this creates
+friction for PCB teams who may want to customize without open-sourcing.
+
+GPL was similarly rejected for derivative commercial use concerns.
+
+MIT is the right choice for a community tool in this domain.
+─────────────────────────────────────────────────────────────────────────────
