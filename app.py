@@ -11,114 +11,356 @@ Component Revision Delta (or Difference) Verification - CRDV
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
+import os
 import json
 import time
+import logging
 import re
-import io
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+import urllib.parse
+from pathlib import Path
+from dotenv import load_dotenv
+import openai
+from datetime import datetime, timedelta, timezone
+import plotly.express as px
+import plotly.graph_objects as go
+import sys
+import contextlib
 
-# ── Page Config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="BOM Analyzer",
-    page_icon="🔬",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# Prophet import with error handling
+try:
+    from prophet import Prophet
+except ImportError:
+    st.error("Prophet library not found. Please install it: pip install prophet")
+    st.stop()
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-  .title-bar { font-size:2rem; font-weight:700; color:#0078d4; margin-bottom:0; }
-  .subtitle  { font-size:.95rem; color:#555; margin-bottom:1.5rem; }
-  .section-head { font-size:1rem; font-weight:700; color:#0078d4; border-bottom:2px solid #0078d4;
-                  padding-bottom:4px; margin-bottom:.8rem; }
-  .risk-high   { background:#fee2e2; border-left:4px solid #d13438; padding:5px 10px; border-radius:4px; }
-  .risk-mod    { background:#fef3c7; border-left:4px solid #ca5010; padding:5px 10px; border-radius:4px; }
-  .risk-low    { background:#dcfce7; border-left:4px solid #107c10; padding:5px 10px; border-radius:4px; }
-  .kpi-box { background:#f0f4fa; border-radius:8px; padding:1rem; border-left:4px solid #0078d4; }
-</style>
-""", unsafe_allow_html=True)
+# Load environment variables
+load_dotenv()
 
-# ── Constants (exact from source) ─────────────────────────────────────────────
-RISK_WEIGHTS     = {'Sourcing': 0.30, 'Stock': 0.15, 'LeadTime': 0.15, 'Lifecycle': 0.30, 'Geographic': 0.10}
-GEO_RISK_TIERS   = {
-    "China":7,"Russia":9,"Taiwan":5,"Malaysia":4,"Vietnam":4,"India":5,"Philippines":4,
-    "Thailand":4,"South Korea":3,"USA":1,"United States":1,"Mexico":2,"Canada":1,"Japan":1,
-    "Germany":1,"France":1,"UK":1,"Ireland":1,"Switzerland":1,"EU":1,
-    "Unknown":4,"N/A":4,"_DEFAULT_":4,
+# Configure logging (Streamlit captures stdout)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# API Keys
+DIGIKEY_CLIENT_ID = os.getenv('DIGIKEY_CLIENT_ID')
+DIGIKEY_CLIENT_SECRET = os.getenv('DIGIKEY_CLIENT_SECRET')
+MOUSER_API_KEY = os.getenv('MOUSER_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') or os.getenv('CHATGPT_API_KEY')
+NEXAR_CLIENT_ID = os.getenv('NEXAR_CLIENT_ID')
+NEXAR_CLIENT_SECRET = os.getenv('NEXAR_CLIENT_SECRET')
+ARROW_API_KEY = os.getenv('ARROW_API_KEY')
+AVNET_API_KEY = os.getenv('AVNET_API_KEY')
+
+# API availability flags (simplified; we'll check later)
+API_KEYS = {
+    "DigiKey": bool(DIGIKEY_CLIENT_ID and DIGIKEY_CLIENT_SECRET),
+    "Mouser": bool(MOUSER_API_KEY),
+    "OpenAI": bool(OPENAI_API_KEY),
+    "Octopart (Nexar)": bool(NEXAR_CLIENT_ID and NEXAR_CLIENT_SECRET),
+    "Arrow": bool(ARROW_API_KEY),
+    "Avnet": bool(AVNET_API_KEY),
 }
-RISK_CATEGORIES  = {'high':(6.6,10.0), 'moderate':(3.6,6.5), 'low':(0.0,3.5)}
-API_TIMEOUT      = 20
-MAX_WORKERS      = 6
 
-# Country name → ISO2 helpers for COO matching
-COUNTRY_ISO = {
-    "CN":"China","TW":"Taiwan","US":"United States","MX":"Mexico","DE":"Germany",
-    "JP":"Japan","KR":"South Korea","MY":"Malaysia","VN":"Vietnam","IN":"India",
-    "PH":"Philippines","TH":"Thailand","CA":"Canada","FR":"France","GB":"UK",
-    "IE":"Ireland","CH":"Switzerland","RU":"Russia",
+# Initialize OpenAI client if key available
+if API_KEYS["OpenAI"]:
+    openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+else:
+    openai_client = None
+
+# Constants
+DEFAULT_TARIFF_RATE = 0.035
+API_TIMEOUT_SECONDS = 20
+MAX_API_WORKERS = 8  # Not used in sync version, but kept for reference
+
+# Risk weights and categories (from original)
+RISK_WEIGHTS = {'Sourcing': 0.30, 'Stock': 0.15, 'LeadTime': 0.15, 'Lifecycle': 0.30, 'Geographic': 0.10}
+GEO_RISK_TIERS = {
+    "China": 7, "Russia": 9, "Taiwan": 5, "Malaysia": 4, "Vietnam": 4, "India": 5, "Philippines": 4,
+    "Thailand": 4, "South Korea": 3, "USA": 1, "United States": 1, "Mexico": 2, "Canada": 1, "Japan": 1,
+    "Germany": 1, "France": 1, "UK": 1, "Ireland": 1, "Switzerland": 1, "EU": 1,
+    "Unknown": 4, "N/A": 4, "_DEFAULT_": 4
 }
+RISK_CATEGORIES = {'high': (6.6, 10.0), 'moderate': (3.6, 6.5), 'low': (0.0, 3.5)}
 
-# ── Utility Functions (ported from source) ─────────────────────────────────────
+# File paths (for caching tokens, etc.)
+CACHE_DIR = Path.cwd() / 'cache'
+CACHE_DIR.mkdir(exist_ok=True)
+TOKEN_FILE = CACHE_DIR / 'digikey_oauth2_token.json'
+NEXAR_TOKEN_FILE = CACHE_DIR / 'nexar_oauth2_token.json'
+HISTORICAL_DATA_FILE = Path.cwd() / 'bom_historical_data.csv'
+PREDICTION_FILE = Path.cwd() / 'supply_chain_predictions.csv'
+
+# CSV headers (same as original)
+HIST_HEADER = ['Component', 'Manufacturer', 'Part_Number', 'Distributor', 'Lead_Time_Days', 'Cost', 'Inventory', 'Stock_Probability', 'Fetch_Timestamp']
+PRED_HEADER = ['Component', 'Date', 'Prophet_Lead', 'Prophet_Cost', 'RAG_Lead', 'RAG_Cost', 'AI_Lead', 'AI_Cost', 'Stock_Probability', 'Real_Lead', 'Real_Cost', 'Real_Stock', 'Prophet_Ld_Acc', 'Prophet_Cost_Acc', 'RAG_Ld_Acc', 'RAG_Cost_Acc','AI_Ld_Acc', 'AI_Cost_Acc']
+
+# -------------------- Utility Functions (adapted) --------------------
 
 def safe_float(value, default=np.nan):
     if value is None or isinstance(value, bool): return default
-    if isinstance(value, (int,float)):
+    if isinstance(value, (int, float)):
         return float(value) if not np.isinf(value) else default
     try:
-        s = str(value).strip().replace('$','').replace(',','').replace('%','').lower()
-        if not s or s in ['n/a','none','inf','-inf','na','nan','']: return default
-        return float(s)
-    except: return default
+        s_val = str(value).strip().replace('$', '').replace(',', '').replace('%', '').lower()
+        if not s_val or s_val in ['n/a', 'none', 'inf', '-inf', 'na', 'nan', '']:
+            return default
+        return float(s_val)
+    except (ValueError, TypeError):
+        return default
 
-
-def convert_lead_time_to_days(val):
-    """Exact port of source convert_lead_time_to_days."""
-    if val is None or (isinstance(val, float) and np.isnan(val)): return np.nan
-    if isinstance(val, (int, float)):
-        return int(round(val)) if not np.isinf(val) else np.nan
-    s = str(val).lower().strip()
-    if s in ['n/a','unknown','','na','none']: return np.nan
-    if s == 'stock': return 0
+def convert_lead_time_to_days(lead_time_str):
+    if lead_time_str is None or pd.isna(lead_time_str): return np.nan
+    if isinstance(lead_time_str, (int, float)):
+        return int(round(lead_time_str))
+    s = str(lead_time_str).lower().strip()
+    if s in ['n/a', 'unknown', '', 'na', 'none', 'stock']:
+        return 0 if s == 'stock' else np.nan
     try:
-        m = re.search(r'(\d+(\.\d+)?)', s)
-        if not m: return np.nan
-        num = float(m.group(1))
-        if 'week' in s: return int(round(num * 7))
-        return int(round(num))
-    except: return np.nan
+        match = re.search(r'(\d+(\.\d+)?)', s)
+        if not match: return np.nan
+        num = float(match.group(1))
+        if 'week' in s:
+            return int(round(num * 7))
+        elif 'day' in s:
+            return int(round(num))
+        else:
+            return int(round(num))
+    except:
+        return np.nan
 
+def init_csv_file(filepath, header):
+    if not filepath.exists():
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+        logger.info(f"Created {filepath.name}")
 
+def append_to_csv(filepath, data_rows):
+    if not data_rows: return
+    try:
+        with open(filepath, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerows(data_rows)
+    except Exception as e:
+        logger.error(f"Failed to append to {filepath.name}: {e}")
+
+# --- Supplier API Wrappers (adapted to standalone functions) ---
+
+def search_mouser(part_number, manufacturer=""):
+    if not MOUSER_API_KEY:
+        logger.debug("Mouser API key not set")
+        return None
+    url = "https://api.mouser.com/api/v1/search/keyword"
+    params = {'apiKey': MOUSER_API_KEY}
+    keyword = f"{manufacturer} {part_number}".strip() if manufacturer else part_number
+    body = {'SearchByKeywordRequest': {'keyword': keyword, 'records': 5, 'startingRecord': 0}}
+    try:
+        response = requests.post(url, params=params, json=body, timeout=API_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        data = response.json()
+        if 'Errors' in data and data['Errors']:
+            return None
+        parts = data.get('SearchResults', {}).get('Parts', [])
+        if not parts:
+            return None
+        # Simple: take first result (could be improved)
+        best = parts[0]
+        lead_time_days = convert_lead_time_to_days(best.get('LeadTime'))
+        pricing = []
+        for pb in best.get('PriceBreaks', []):
+            qty = safe_float(pb.get('Quantity'), default=0)
+            price = safe_float(pb.get('Price', '').replace('$',''))
+            if qty > 0 and pd.notna(price):
+                pricing.append({'qty': int(qty), 'price': price})
+        pricing.sort(key=lambda x: x['qty'])
+        result = {
+            "Source": "Mouser",
+            "SourcePartNumber": best.get('MouserPartNumber', "N/A"),
+            "ManufacturerPartNumber": best.get('ManufacturerPartNumber', "N/A"),
+            "Manufacturer": best.get('Manufacturer', "N/A"),
+            "Description": best.get('Description', "N/A"),
+            "Stock": int(safe_float(best.get('AvailabilityInStock', 0), default=0)),
+            "LeadTimeDays": lead_time_days,
+            "MinOrderQty": int(safe_float(best.get('Min', 0), default=1)),
+            "Packaging": best.get('Packaging', "N/A"),
+            "Pricing": pricing,
+            "CountryOfOrigin": best.get("CountryOfOrigin", "N/A"),
+            "TariffCode": "N/A",
+            "NormallyStocking": True,
+            "Discontinued": False,
+            "EndOfLife": False,
+            "DatasheetUrl": best.get('DataSheetUrl', "N/A"),
+            "ApiTimestamp": datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Mouser search failed for {part_number}: {e}")
+        return None
+
+# Nexar (Octopart) - requires client credentials token
+def get_nexar_token():
+    if not NEXAR_CLIENT_ID or not NEXAR_CLIENT_SECRET:
+        return None
+    # Check cache
+    if NEXAR_TOKEN_FILE.exists():
+        try:
+            with open(NEXAR_TOKEN_FILE, 'r') as f:
+                token_data = json.load(f)
+            if time.time() < token_data.get('expires_at', 0):
+                return token_data.get('access_token')
+        except:
+            pass
+    # Get new token
+    url = "https://identity.nexar.com/connect/token"
+    payload = {
+        'grant_type': 'client_credentials',
+        'client_id': NEXAR_CLIENT_ID,
+        'client_secret': NEXAR_CLIENT_SECRET,
+        'scope': 'supply.domain'
+    }
+    try:
+        response = requests.post(url, data=payload, timeout=API_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        token_data = response.json()
+        expires_in = token_data.get('expires_in', 3600)
+        token_data['expires_at'] = time.time() + expires_in - 60
+        with open(NEXAR_TOKEN_FILE, 'w') as f:
+            json.dump(token_data, f)
+        return token_data.get('access_token')
+    except Exception as e:
+        logger.error(f"Nexar token error: {e}")
+        return None
+
+def search_octopart_nexar(part_number, manufacturer=""):
+    token = get_nexar_token()
+    if not token:
+        return None
+    url = "https://api.nexar.com/graphql"
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    query = f"""
+    query {{
+      supSearchMpn(q: "{part_number}", limit: 1, country: "US", currency: "USD") {{
+        results {{
+          part {{
+            mpn
+            manufacturer {{ name }}
+            shortDescription
+            bestDatasheet {{ url }}
+            sellers(authorizedOnly: false) {{
+              company {{ name }}
+              isAuthorized
+              offers {{
+                sku
+                inventoryLevel
+                moq
+                packaging
+                factoryLeadDays
+                prices {{ quantity price currency }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    try:
+        response = requests.post(url, headers=headers, json={'query': query}, timeout=API_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        data = response.json()
+        if 'errors' in data:
+            return None
+        results = data.get('data', {}).get('supSearchMpn', {}).get('results', [])
+        if not results:
+            return None
+        part_data = results[0].get('part', {})
+        # Pick best offer (first seller, first offer)
+        sellers = part_data.get('sellers', [])
+        best_offer = None
+        for seller in sellers:
+            offers = seller.get('offers', [])
+            if offers:
+                best_offer = offers[0]
+                best_offer['seller_name'] = seller.get('company', {}).get('name', 'Unknown')
+                break
+        if not best_offer:
+            return None
+        lead_time_days = safe_float(best_offer.get('factoryLeadDays'), default=np.nan)
+        lead_time_days = int(lead_time_days) if pd.notna(lead_time_days) else np.nan
+        pricing = []
+        for p in best_offer.get('prices', []):
+            if p.get('currency') == 'USD':
+                qty = int(p.get('quantity', 0))
+                price = safe_float(p.get('price'))
+                if qty > 0 and pd.notna(price):
+                    pricing.append({'qty': qty, 'price': price})
+        pricing.sort(key=lambda x: x['qty'])
+        result = {
+            "Source": "Octopart (Nexar)",
+            "SourcePartNumber": best_offer.get('sku', "N/A"),
+            "ManufacturerPartNumber": part_data.get('mpn', part_number),
+            "Manufacturer": part_data.get('manufacturer', {}).get('name', manufacturer or "N/A"),
+            "Description": part_data.get('shortDescription', "N/A"),
+            "Stock": int(safe_float(best_offer.get('inventoryLevel', 0), default=0)),
+            "LeadTimeDays": lead_time_days,
+            "MinOrderQty": int(safe_float(best_offer.get('moq', 0), default=0)),
+            "Packaging": best_offer.get('packaging', "N/A"),
+            "Pricing": pricing,
+            "CountryOfOrigin": "N/A",
+            "TariffCode": "N/A",
+            "NormallyStocking": True,
+            "Discontinued": False,
+            "EndOfLife": False,
+            "DatasheetUrl": part_data.get('bestDatasheet', {}).get('url', 'N/A'),
+            "ApiTimestamp": datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        }
+        return result
+    except Exception as e:
+        logger.error(f"Nexar search failed for {part_number}: {e}")
+        return None
+
+# Arrow and Avnet placeholders (return None)
+def search_arrow(part_number, manufacturer=""):
+    return None
+def search_avnet(part_number, manufacturer=""):
+    return None
+
+# DigiKey placeholder (return None for now)
+def search_digikey(part_number, manufacturer=""):
+    # Could be implemented with OAuth if needed, but skip for simplicity
+    return None
+
+# Function to fetch data from all enabled suppliers (synchronous)
+def get_part_data(part_number, manufacturer):
+    results = {}
+    if API_KEYS["Mouser"]:
+        res = search_mouser(part_number, manufacturer)
+        if res:
+            results["Mouser"] = res
+    if API_KEYS["Octopart (Nexar)"]:
+        res = search_octopart_nexar(part_number, manufacturer)
+        if res:
+            results["Octopart (Nexar)"] = res
+    # Add others if implemented
+    return results
+
+# Optimal cost calculation (from original)
 def get_optimal_cost(qty_needed, pricing_breaks, min_order_qty=0, buy_up_threshold_pct=1.0):
-    """
-    Exact port of BOMAnalyzerApp.get_optimal_cost.
-    Returns (unit_price, total_cost, actual_order_qty, notes)
-    """
     notes = ""
-    if not isinstance(qty_needed, (int,float)) or qty_needed <= 0:
+    if not isinstance(qty_needed, (int, float)) or qty_needed <= 0:
         return np.nan, np.nan, qty_needed, "Invalid Qty Needed"
     if not isinstance(pricing_breaks, list):
         return np.nan, np.nan, qty_needed, "Invalid Pricing Data"
-
     try:
-        valid_breaks = [
-            {'qty': int(pb['qty']), 'price': safe_float(pb['price'])}
-            for pb in pricing_breaks
-            if isinstance(pb, dict) and 'qty' in pb and 'price' in pb
-            and int(pb['qty']) > 0 and pd.notna(safe_float(pb['price']))
-            and safe_float(pb['price']) >= 0
-        ]
+        valid_breaks = [{'qty': int(pb['qty']), 'price': safe_float(pb['price'])} for pb in pricing_breaks
+                        if isinstance(pb, dict) and pb.get('qty', 0) > 0 and pd.notna(safe_float(pb.get('price')))]
         if not valid_breaks:
             return np.nan, np.nan, qty_needed, "No Valid Price Breaks"
         pricing_breaks = sorted(valid_breaks, key=lambda x: x['qty'])
-        min_order_qty  = max(1, int(safe_float(min_order_qty, default=1)))
-    except Exception as e:
-        return np.nan, np.nan, qty_needed, f"Pricing Data Error: {e}"
+        min_order_qty = max(1, int(safe_float(min_order_qty, default=1)))
+    except:
+        return np.nan, np.nan, qty_needed, "Pricing Data Error"
 
     base_order_qty = max(int(qty_needed), min_order_qty)
-
     base_unit_price = np.nan
     applicable_break = None
     for pb in pricing_breaks:
@@ -130,1163 +372,637 @@ def get_optimal_cost(qty_needed, pricing_breaks, min_order_qty=0, buy_up_thresho
         base_unit_price = applicable_break['price']
     elif pricing_breaks:
         applicable_break = pricing_breaks[0]
-        base_unit_price  = applicable_break['price']
-        base_order_qty   = max(base_order_qty, applicable_break['qty'])
+        base_unit_price = applicable_break['price']
+        base_order_qty = max(base_order_qty, applicable_break['qty'])
         notes += f"MOQ adjusted to first break ({base_order_qty}). "
     else:
         return np.nan, np.nan, qty_needed, "Cannot Determine Base Price"
 
-    best_total_cost  = base_unit_price * base_order_qty
-    best_unit_price  = base_unit_price
+    best_total_cost = base_unit_price * base_order_qty
+    best_unit_price = base_unit_price
     actual_order_qty = base_order_qty
 
     for pb in pricing_breaks:
-        break_qty   = pb['qty']
+        break_qty = pb['qty']
         break_price = pb['price']
         if break_qty >= base_order_qty:
             total_cost_at_break = break_qty * break_price
             if total_cost_at_break < best_total_cost * (1.0 - (buy_up_threshold_pct / 100.0)):
-                best_total_cost  = total_cost_at_break
-                best_unit_price  = break_price
+                best_total_cost = total_cost_at_break
+                best_unit_price = break_price
                 actual_order_qty = break_qty
                 notes = f"Price break @ {break_qty} lower total cost. "
-            elif (actual_order_qty < break_qty and
-                  total_cost_at_break <= best_total_cost * (1.0 + (buy_up_threshold_pct / 100.0))):
-                best_total_cost  = total_cost_at_break
-                best_unit_price  = break_price
+            elif actual_order_qty < break_qty and total_cost_at_break <= best_total_cost * (1.0 + (buy_up_threshold_pct / 100.0)):
+                best_total_cost = total_cost_at_break
+                best_unit_price = break_price
                 actual_order_qty = break_qty
                 notes = f"Bought up to {break_qty} for similar total cost. "
-
     return best_unit_price, best_total_cost, actual_order_qty, notes.strip()
 
+# Stock probability heuristic (simplified)
+def calculate_stock_probability_simple(options_list, qty_needed):
+    if not options_list: return 0.0
+    suppliers_with_stock = 0
+    total_stock = 0
+    for opt in options_list:
+        stock = opt.get('stock', 0)
+        if stock >= qty_needed:
+            suppliers_with_stock += 1
+        total_stock += stock
+    if suppliers_with_stock >= 2: score = 90.0
+    elif suppliers_with_stock == 1: score = 70.0
+    else: score = 15.0
+    # adjust based on total stock ratio
+    if total_stock > qty_needed * 5 and suppliers_with_stock > 0: score += 5.0
+    elif total_stock < qty_needed * 1.2 and suppliers_with_stock > 0: score -= 5.0
+    return round(max(0.0, min(100.0, score)), 1)
 
-def calculate_risk_score(sourcing_count, stock_available, qty_needed,
-                         lead_time_days, lifecycle_notes, coo):
-    """
-    Exact port of source risk factor logic from analyze_single_part.
-    Returns (overall_score 0-10, risk_factors dict)
-    """
-    risk_factors = {}
+# Tariff info (simplified: return default)
+def get_tariff_info(hts_code, country_of_origin, custom_tariff_rates):
+    # Use custom rate if provided, else default
+    coo = str(country_of_origin).strip() if country_of_origin else ""
+    if coo and coo in custom_tariff_rates:
+        return custom_tariff_rates[coo], "Custom"
+    return DEFAULT_TARIFF_RATE, "Default"
 
-    # Sourcing risk  (0, 4, 7, 10)
-    if sourcing_count == 0:   risk_factors['Sourcing'] = 10
-    elif sourcing_count == 1: risk_factors['Sourcing'] = 7
-    elif sourcing_count == 2: risk_factors['Sourcing'] = 4
-    else:                     risk_factors['Sourcing'] = 0
-
-    # Stock risk
-    has_stock_gap = (stock_available < qty_needed)
-    if has_stock_gap:                                    risk_factors['Stock'] = 8
-    elif stock_available < 1.5 * qty_needed:             risk_factors['Stock'] = 4
-    else:                                                risk_factors['Stock'] = 0
-
-    # Lead time risk (based on fastest available)
-    lt = lead_time_days
-    if pd.isna(lt) or lt == np.inf:       risk_factors['LeadTime'] = 9
-    elif lt == 0:                          risk_factors['LeadTime'] = 0
-    elif lt > 90:                          risk_factors['LeadTime'] = 7
-    elif lt > 45:                          risk_factors['LeadTime'] = 4
-    else:                                  risk_factors['LeadTime'] = 1
-
-    # Lifecycle risk
-    lc = str(lifecycle_notes).upper()
-    if "EOL" in lc or "DISC" in lc:       risk_factors['Lifecycle'] = 10
-    else:                                  risk_factors['Lifecycle'] = 0
-
-    # Geographic risk
-    # Try to match country name from COO string
-    coo_str = str(coo).strip()
-    geo_score = GEO_RISK_TIERS.get("_DEFAULT_", 4)
-    for country, score in GEO_RISK_TIERS.items():
-        if country.lower() in coo_str.lower():
-            geo_score = score
-            break
-    risk_factors['Geographic'] = geo_score
-
-    overall = sum(risk_factors[f] * RISK_WEIGHTS[f] for f in RISK_WEIGHTS)
-    overall = round(max(0.0, min(10.0, overall)), 1)
-    return overall, risk_factors
-
-
-def get_tariff_rate(coo, custom_tariffs):
-    """Map COO to tariff rate using custom tariff table or defaults."""
-    coo_str = str(coo).strip().lower()
-    for country, rate in custom_tariffs.items():
-        if country.lower() in coo_str:
-            return rate
-    # Default tariff
-    if "china" in coo_str or "cn" == coo_str: return 0.25
-    if "taiwan" in coo_str or "tw" == coo_str: return 0.0
-    return 0.035  # WTO baseline
-
-
-# ── Part Number Cleaner ───────────────────────────────────────────────────────
-
-def clean_part_number(pn):
-    """
-    Clean and normalize part numbers before sending to supplier APIs.
-    Handles all patterns found in real-world PCB BOM exports:
-    - Leading apostrophes from Excel  ('9001-12-01 → 9001-12-01)
-    - PBFREE / PB FREE suffix         (2N3906 PBFREE → 2N3906)
-    - Trailing/leading whitespace     (C3216X7R2E104K160AA  → C3216X7R2E104K160AA)
-    - Embedded newlines from CSV      (cleaned at CSV-read stage)
-    - ADI #PBF suffix                 (LTC2057HVHS8#PBF → KEEP as-is, Mouser recognizes it)
-    Returns (cleaned_pn, original_pn, list_of_changes)
-    """
-    original = pn
-    changes  = []
-    p        = str(pn).strip()
-
-    # Remove leading apostrophe/quote (Excel CSV artifact — Excel prepends ' to
-    # prevent numeric interpretation of part numbers like 9001-12-01)
-    if p.startswith(("'", '"', "`")):
-        p = p.lstrip("'\"`")
-        changes.append("removed leading apostrophe (Excel artifact)")
-
-    # Remove PBFREE / PB-FREE / PB FREE suffix (RoHS marker, not part of MPN)
-    # Important: Do NOT strip #PBF from ADI/LTC parts — it IS part of their MPN
-    pbfree_variants = [" PBFREE", "-PBFREE", "_PBFREE", " PB-FREE", "-PB-FREE", " PB FREE"]
-    p_upper = p.upper()
-    for suffix in pbfree_variants:
-        if p_upper.endswith(suffix):
-            p = p[:len(p) - len(suffix)].strip(" -_")
-            changes.append(f"removed '{suffix.strip()}' suffix")
-            break
-
-    # Remove common distributor/packaging suffixes that aren't part of the base MPN
-    # Exception: #PBF is kept because ADI/LTC use it as part of their official MPN
-    dist_suffixes = ["-ND", "-1-ND", "-2-ND", "-TR", "-T&R", "-TRC",
-                     "-CT", "-CUT", "-REEL", "/T", "-T"]
-    p_upper = p.upper()
-    for suffix in dist_suffixes:
-        if p_upper.endswith(suffix.upper()):
-            p = p[:len(p) - len(suffix)].strip(" -_")
-            changes.append(f"removed distributor suffix '{suffix}'")
-            break
-
-    # Final whitespace cleanup
-    p_clean = p.strip()
-    if p_clean != original.strip() and not changes:
-        changes.append("stripped whitespace")
-
-    return p_clean, original, changes
-
-
-# ── API Functions ─────────────────────────────────────────────────────────────
-
-def search_mouser(part_number, api_key):
-    """Fetch from Mouser API. Returns standardized result dict or None."""
-    if not api_key: return None
-    url    = "https://api.mouser.com/api/v1/search/partnumber"
-    params = {"apiKey": api_key}
-    payload= {"SearchByPartRequest": {"mouserPartNumber": part_number, "partSearchOptions": "string"}}
-    try:
-        r     = requests.post(url, params=params, json=payload, timeout=API_TIMEOUT)
-        r.raise_for_status()
-        data  = r.json()
-        parts = data.get("SearchResults", {}).get("Parts", [])
-        if not parts: return None
-        p = parts[0]
-
-        price_breaks = []
-        for pb in p.get("PriceBreaks", []):
-            try:
-                qty   = int(pb.get("Quantity", 0))
-                price = safe_float(str(pb.get("Price","0")).replace("$","").replace(",",""))
-                if qty > 0 and pd.notna(price) and price > 0:
-                    price_breaks.append({"qty": qty, "price": price})
-            except: continue
-
-        raw_lt  = p.get("LeadTime", "")
-        lt_days = convert_lead_time_to_days(raw_lt)
-
-        eol  = p.get("LifecycleStatus","").upper()
-        is_eol  = any(x in eol for x in ["OBSOLETE","EOL","DISCONTINUED","NOT RECOMMENDED"])
-        is_disc = "DISCONTINUED" in eol
-
-        return {
-            "Source":                 "Mouser",
-            "SourcePartNumber":       p.get("MouserPartNumber","N/A"),
-            "ManufacturerPartNumber": p.get("ManufacturerPartNumber", part_number),
-            "Manufacturer":           p.get("Manufacturer","N/A"),
-            "Description":            p.get("Description",""),
-            "Stock":                  int(safe_float(p.get("AvailabilityInStock",0), default=0)),
-            "LeadTimeDays":           lt_days,
-            "MinOrderQty":            int(safe_float(p.get("Min","1"), default=1)),
-            "Pricing":                price_breaks,
-            "CountryOfOrigin":        p.get("CountryOfOrigin","Unknown"),
-            "NormallyStocking":       True,
-            "Discontinued":           is_disc,
-            "EndOfLife":              is_eol,
-            "DatasheetUrl":           p.get("DataSheetUrl",""),
+# Main analysis for a single part (adapted from original)
+def analyze_single_part(bom_part_number, bom_manufacturer, bom_qty_per_unit, config):
+    total_units = config.get('total_units', 1)
+    buy_up_threshold_pct = config.get('buy_up_threshold', 1.0)
+    total_qty_needed = int(bom_qty_per_unit * total_units)
+    if total_qty_needed <= 0:
+        gui_entry = {
+            "PartNumber": bom_part_number, "Manufacturer": bom_manufacturer or "N/A", "MfgPN": "NOT FOUND",
+            "QtyNeed": total_qty_needed, "Status": "Error", "Sources": "0", "StockAvail": "N/A",
+            "COO": "N/A", "RiskScore": "10.0", "TariffPct": "N/A", "BestCostPer": "N/A",
+            "BestTotalCost": "N/A", "ActualBuyQty": "N/A", "BestCostLT": "N/A", "BestCostSrc": "N/A",
+            "Alternates": "No", "AlternatesList": [], "Notes": "Invalid quantity"
         }
-    except Exception as e:
-        return None
+        return [gui_entry], [], {}
 
+    # Fetch data from suppliers
+    part_results_by_supplier = get_part_data(bom_part_number, bom_manufacturer)
 
-def search_nexar(part_number, client_id, client_secret, _token_cache):
-    """Fetch from Nexar (Octopart) GraphQL API. Returns standardized result dict or None."""
-    if not client_id or not client_secret: return None
-
-    # Token handling with simple in-memory cache passed as mutable dict
-    now = time.time()
-    if _token_cache.get("expires_at", 0) > now + 60:
-        token = _token_cache["access_token"]
-    else:
-        try:
-            tr = requests.post("https://identity.nexar.com/connect/token",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={"grant_type":"client_credentials","client_id":client_id,
-                      "client_secret":client_secret,"scope":"supply.domain"},
-                timeout=API_TIMEOUT)
-            tr.raise_for_status()
-            td = tr.json()
-            token = td.get("access_token")
-            if not token: return None
-            _token_cache["access_token"] = token
-            _token_cache["expires_at"]   = now + td.get("expires_in", 3600) - 60
-        except: return None
-
-    query = """
-    query Search($q: String!) {
-      supSearch(q: $q, limit: 1) {
-        hits {
-          part {
-            mpn
-            shortDescription
-            manufacturer { name }
-            bestDatasheet { url }
-            sellers(includeBrokers: false) {
-              company { name }
-              offers {
-                sku
-                inventoryLevel
-                moq
-                factoryLeadDays
-                packaging
-                prices { quantity price currency }
-              }
-            }
-          }
+    if not part_results_by_supplier:
+        gui_entry = {
+            "PartNumber": bom_part_number, "Manufacturer": bom_manufacturer or "N/A", "MfgPN": "NOT FOUND",
+            "QtyNeed": total_qty_needed, "Status": "Unknown", "Sources": "0", "StockAvail": "N/A",
+            "COO": "N/A", "RiskScore": "10.0", "TariffPct": "N/A", "BestCostPer": "N/A",
+            "BestTotalCost": "N/A", "ActualBuyQty": "N/A", "BestCostLT": "N/A", "BestCostSrc": "N/A",
+            "Alternates": "No", "AlternatesList": [], "Notes": "No supplier data"
         }
-      }
-    }"""
-    try:
-        r = requests.post("https://api.nexar.com/graphql",
-            json={"query": query, "variables": {"q": part_number}},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=API_TIMEOUT)
-        r.raise_for_status()
-        hits = r.json().get("data",{}).get("supSearch",{}).get("hits",[])
-        if not hits: return None
+        return [gui_entry], [], {}
 
-        part_data = hits[0]["part"]
-        best_offer = None; best_price = float('inf'); best_seller = ""
-
-        for seller in part_data.get("sellers", []):
-            for offer in seller.get("offers", []):
-                usd_prices = [p for p in offer.get("prices",[]) if p.get("currency") == "USD"]
-                if usd_prices:
-                    min_p = min(safe_float(p["price"]) for p in usd_prices if pd.notna(safe_float(p["price"])))
-                    if pd.notna(min_p) and min_p < best_price:
-                        best_price  = min_p
-                        best_offer  = offer
-                        best_seller = seller.get("company",{}).get("name","")
-
-        if not best_offer: return None
-
-        pricing = sorted([
-            {"qty": int(p["quantity"]), "price": safe_float(p["price"])}
-            for p in best_offer.get("prices",[])
-            if p.get("currency") == "USD" and pd.notna(safe_float(p.get("price")))
-        ], key=lambda x: x["qty"])
-
-        lt_raw  = best_offer.get("factoryLeadDays")
-        lt_days = int(safe_float(lt_raw)) if pd.notna(safe_float(lt_raw)) else np.nan
-
-        return {
-            "Source":                 best_seller or "Octopart (Nexar)",
-            "SourcePartNumber":       best_offer.get("sku","N/A"),
-            "ManufacturerPartNumber": part_data.get("mpn", part_number),
-            "Manufacturer":           part_data.get("manufacturer",{}).get("name","N/A"),
-            "Description":            part_data.get("shortDescription",""),
-            "Stock":                  int(safe_float(best_offer.get("inventoryLevel",0), default=0)),
-            "LeadTimeDays":           lt_days,
-            "MinOrderQty":            int(safe_float(best_offer.get("moq",1), default=1)),
-            "Pricing":                pricing,
-            "CountryOfOrigin":        "Unknown",
-            "NormallyStocking":       True,
-            "Discontinued":           False,
-            "EndOfLife":              False,
-            "DatasheetUrl":           part_data.get("bestDatasheet",{}).get("url","") if isinstance(part_data.get("bestDatasheet"),dict) else "",
-        }
-    except: return None
-
-
-def get_part_data_parallel(part_number, mouser_key, nexar_id, nexar_secret, nexar_token_cache):
-    """Fetch from all enabled suppliers in parallel. Returns dict of {supplier: result}."""
-    results = {}
-    tasks   = {}
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="API") as ex:
-        if mouser_key:
-            tasks[ex.submit(search_mouser, part_number, mouser_key)] = "Mouser"
-        if nexar_id and nexar_secret:
-            tasks[ex.submit(search_nexar, part_number, nexar_id, nexar_secret, nexar_token_cache)] = "Nexar"
-
-        for future in as_completed(tasks, timeout=30):
-            name = tasks[future]
-            try:
-                result = future.result()
-                if result and isinstance(result, dict):
-                    results[name] = result
-            except: pass
-    return results
-
-
-def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
-                        mouser_key, nexar_id, nexar_secret, nexar_token_cache):
-    """
-    Core single-part analysis. Faithful port of BOMAnalyzerApp.analyze_single_part.
-    Returns dict with all fields for display and strategy engine.
-    """
-    total_units       = config.get("total_units", 100)
-    buy_up_pct        = config.get("buy_up_threshold", 1.0)
-    custom_tariffs    = config.get("custom_tariff_rates", {})
-    total_qty_needed  = int(bom_qty_per_unit * total_units)
-
-    # Fetch data
-    supplier_data = get_part_data_parallel(bom_pn, mouser_key, nexar_id, nexar_secret, nexar_token_cache)
-
-    # No data found case
-    if not supplier_data:
-        return {
-            "PartNumber": bom_pn, "Manufacturer": bom_mfg or "N/A",
-            "MfgPN": bom_pn, "QtyNeed": total_qty_needed,
-            "Status": "Not Found", "Sources": "0", "StockAvail": 0,
-            "COO": "Unknown", "RiskScore": 10.0, "TariffPct": "N/A",
-            "BestCostPer": "N/A", "BestTotalCost": "N/A", "ActualBuyQty": "N/A",
-            "BestCostLT": "N/A", "BestCostSrc": "N/A",
-            "Description": "No supplier data — check API keys",
-            "Notes": "No data", "_options": [], "_valid": False,
-        }
-
-    # Build options list
+    # Process each supplier option
     all_options = []
-    for src_name, sd in supplier_data.items():
-        pricing = sd.get("Pricing", [])
-        moq     = sd.get("MinOrderQty", 1)
-        unit_p, total_c, act_qty, notes = get_optimal_cost(
-            total_qty_needed, pricing, moq, buy_up_pct
+    for source, data in part_results_by_supplier.items():
+        if not isinstance(data, dict): continue
+        pricing = data.get('Pricing', [])
+        unit_cost, total_cost, actual_qty, cost_notes = get_optimal_cost(
+            total_qty_needed, pricing, data.get('MinOrderQty', 0), buy_up_threshold_pct
         )
-        stock   = sd.get("Stock", 0)
-        lt_days = sd.get("LeadTimeDays", np.nan)
-        if isinstance(lt_days, float) and np.isnan(lt_days):
-            effective_lt = np.inf
-        else:
-            effective_lt = 0 if stock >= total_qty_needed else (lt_days if pd.notna(lt_days) else np.inf)
+        lead = data.get('LeadTimeDays', np.inf)
+        if pd.isna(lead):
+            lead = np.inf
+        option = {
+            "source": source,
+            "cost": total_cost if pd.notna(total_cost) else np.inf,
+            "lead_time": lead,
+            "stock": data.get('Stock', 0),
+            "unit_cost": unit_cost,
+            "actual_order_qty": actual_qty,
+            "moq": data.get('MinOrderQty', 0),
+            "discontinued": data.get('Discontinued', False),
+            "eol": data.get('EndOfLife', False),
+            'bom_pn': bom_part_number,
+            'original_qty_per_unit': bom_qty_per_unit,
+            'total_qty_needed': total_qty_needed,
+            'Manufacturer': data.get('Manufacturer', 'N/A'),
+            'ManufacturerPartNumber': data.get('ManufacturerPartNumber', 'N/A'),
+            'SourcePartNumber': data.get('SourcePartNumber', 'N/A'),
+            'Pricing': pricing,
+            'TariffCode': data.get('TariffCode'),
+            'CountryOfOrigin': data.get('CountryOfOrigin'),
+            'ApiTimestamp': data.get('ApiTimestamp'),
+            'notes': cost_notes,
+        }
+        all_options.append(option)
 
-        all_options.append({
-            "source":          sd.get("Source", src_name),
-            "SourcePartNumber": sd.get("SourcePartNumber","N/A"),
-            "ManufacturerPartNumber": sd.get("ManufacturerPartNumber", bom_pn),
-            "Manufacturer":    sd.get("Manufacturer", bom_mfg or "N/A"),
-            "Description":     sd.get("Description",""),
-            "stock":           stock,
-            "lead_time":       lt_days if pd.notna(lt_days) else np.inf,
-            "effective_lead":  effective_lt,
-            "unit_cost":       unit_p,
-            "cost":            total_c,
-            "actual_order_qty": act_qty,
-            "notes":           notes,
-            "coo":             sd.get("CountryOfOrigin","Unknown"),
-            "eol":             sd.get("EndOfLife", False),
-            "discontinued":    sd.get("Discontinued", False),
-            "lifecycle":       "EOL" if sd.get("EndOfLife") else ("DISC" if sd.get("Discontinued") else "Active"),
-            "DatasheetUrl":    sd.get("DatasheetUrl",""),
-            "pricing":         pricing,
-            "moq":             moq,
-            "bom_pn":          bom_pn,
-            "total_qty_needed": total_qty_needed,
-        })
+    if not all_options:
+        gui_entry = {
+            "PartNumber": bom_part_number, "Manufacturer": bom_manufacturer or "N/A", "MfgPN": "NOT FOUND",
+            "QtyNeed": total_qty_needed, "Status": "Error", "Sources": "0", "StockAvail": "N/A",
+            "COO": "N/A", "RiskScore": "10.0", "TariffPct": "N/A", "BestCostPer": "N/A",
+            "BestTotalCost": "N/A", "ActualBuyQty": "N/A", "BestCostLT": "N/A", "BestCostSrc": "N/A",
+            "Alternates": "No", "AlternatesList": [], "Notes": "Processing error"
+        }
+        return [gui_entry], [], {}
 
-    # Consolidate COO, lifecycle
-    consolidated_coo = "Unknown"
+    # Consolidate manufacturer and MPN
+    consolidated_mfg = bom_manufacturer or "N/A"
+    consolidated_mpn = bom_part_number
     for opt in all_options:
-        if opt["coo"] not in ("Unknown","N/A",""):
-            consolidated_coo = opt["coo"]
+        if opt.get('Manufacturer') and opt['Manufacturer'] != "N/A" and consolidated_mfg == "N/A":
+            consolidated_mfg = opt['Manufacturer']
+        if opt.get('ManufacturerPartNumber') and opt['ManufacturerPartNumber'] != "N/A" and consolidated_mpn == "N/A":
+            consolidated_mpn = opt['ManufacturerPartNumber']
+
+    # COO consolidation (simplified: take first non-N/A)
+    consolidated_coo = "N/A"
+    for opt in all_options:
+        coo = opt.get('CountryOfOrigin')
+        if coo and isinstance(coo, str) and coo.strip().upper() not in ["N/A", "", "UNKNOWN"]:
+            consolidated_coo = coo.strip()
             break
 
-    lifecycle_notes = ""
+    # Calculate stock probability and tariff
+    stock_prob = calculate_stock_probability_simple(all_options, total_qty_needed)
+    tariff_rate, tariff_src = get_tariff_info(None, consolidated_coo, config.get('custom_tariff_rates', {}))
+
+    # Prepare historical entries
+    historical_entries = []
     for opt in all_options:
-        if opt.get("eol"):         lifecycle_notes = "EOL"
-        elif opt.get("discontinued"): lifecycle_notes = "DISC" if not lifecycle_notes else lifecycle_notes
+        historical_entries.append([
+            f"{consolidated_mfg} {consolidated_mpn}".strip(),
+            opt.get('Manufacturer', 'N/A'), opt.get('ManufacturerPartNumber', 'N/A'),
+            opt.get('source'),
+            opt.get('lead_time') if opt.get('lead_time') != np.inf else np.nan,
+            opt.get('unit_cost', np.nan),
+            opt.get('stock', 0),
+            stock_prob,
+            opt.get('ApiTimestamp', datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        ])
 
-    # Valid options (have pricing)
-    valid_options = [o for o in all_options if pd.notna(o.get("cost")) and o.get("cost", np.inf) != np.inf]
+    # Determine best cost option (cheapest, considering stock)
+    options_with_valid_cost = [opt for opt in all_options if opt.get('cost') != np.inf]
+    best_cost_option = None
+    in_stock_options = [opt for opt in options_with_valid_cost if opt.get('stock', 0) >= total_qty_needed]
+    if in_stock_options:
+        best_cost_option = min(in_stock_options, key=lambda x: (x.get('cost', np.inf), x.get('source', '')))
+    elif options_with_valid_cost:
+        best_cost_option = min(options_with_valid_cost, key=lambda x: (x.get('cost', np.inf), x.get('lead_time', np.inf)))
 
-    # Best cost option (lowest total cost)
-    best_cost_option = min(valid_options, key=lambda o: o.get("cost", np.inf)) if valid_options else None
-
-    # Fastest option (lowest effective lead time then cost)
+    # Determine fastest option (shortest lead time, considering stock)
     fastest_option = None
-    if all_options:
-        in_stock = [o for o in all_options if o.get("stock",0) >= total_qty_needed]
-        if in_stock:
-            fastest_option = min(in_stock, key=lambda o: o.get("cost", np.inf))
-        else:
-            with_lt = [o for o in all_options if o.get("lead_time", np.inf) != np.inf]
-            if with_lt:
-                fastest_option = min(with_lt, key=lambda o: o.get("lead_time", np.inf))
+    if in_stock_options:
+        fastest_option = min(in_stock_options, key=lambda x: (x.get('cost', np.inf), x.get('source', '')))  # in stock => lead time 0
+    else:
+        options_with_valid_lt = [opt for opt in all_options if opt.get('lead_time') != np.inf]
+        if options_with_valid_lt:
+            fastest_option = min(options_with_valid_lt, key=lambda x: (x.get('lead_time', np.inf), x.get('cost', np.inf)))
 
-    total_stock = sum(o.get("stock",0) for o in all_options)
+    # Calculate risk score (simplified)
+    num_sources = len(all_options)
+    sourcing_risk = 10 if num_sources <= 1 else 5 if num_sources == 2 else 1
+    has_stock_gap = not any(opt.get('stock', 0) >= total_qty_needed for opt in all_options)
+    stock_risk = 8 if has_stock_gap else 4 if sum(opt.get('stock', 0) for opt in all_options) < 1.5 * total_qty_needed else 0
+    fastest_lead = fastest_option.get('lead_time', np.inf) if fastest_option else np.inf
+    if fastest_lead == 0: lead_risk = 0
+    elif fastest_lead == np.inf: lead_risk = 9
+    elif fastest_lead > 90: lead_risk = 7
+    elif fastest_lead > 45: lead_risk = 4
+    else: lead_risk = 1
+    lifecycle_risk = 10 if any(opt.get('eol') or opt.get('discontinued') for opt in all_options) else 0
+    geo_risk = GEO_RISK_TIERS.get(consolidated_coo, GEO_RISK_TIERS["_DEFAULT_"])
+    overall_risk = (sourcing_risk * 0.3 + stock_risk * 0.15 + lead_risk * 0.15 + lifecycle_risk * 0.3 + geo_risk * 0.1)
+    overall_risk = round(max(0, min(10, overall_risk)), 1)
 
-    # Risk scoring
-    fastest_lt = fastest_option.get("lead_time", np.inf) if fastest_option else np.inf
-    if isinstance(fastest_lt, float) and np.isinf(fastest_lt): fastest_lt_days = np.nan
-    else: fastest_lt_days = fastest_lt
-
-    risk_score, risk_factors = calculate_risk_score(
-        sourcing_count   = len(valid_options),
-        stock_available  = total_stock,
-        qty_needed       = total_qty_needed,
-        lead_time_days   = fastest_lt_days,
-        lifecycle_notes  = lifecycle_notes,
-        coo              = consolidated_coo,
-    )
-
-    tariff_rate = get_tariff_rate(consolidated_coo, custom_tariffs)
-
+    # Status
+    lifecycle_notes = set()
+    if any(opt.get('eol') for opt in all_options): lifecycle_notes.add("EOL")
+    if any(opt.get('discontinued') for opt in all_options): lifecycle_notes.add("DISC")
     status = "Active"
     if "EOL" in lifecycle_notes: status = "EOL"
     elif "DISC" in lifecycle_notes: status = "Discontinued"
 
-    notes_list = []
-    if total_stock < total_qty_needed: notes_list.append("Stock Gap")
-    if best_cost_option and best_cost_option.get("notes"): notes_list.append(best_cost_option["notes"])
+    # Notes
+    notes = []
+    if has_stock_gap: notes.append("Stock Gap")
+    if best_cost_option and best_cost_option.get('notes'): notes.append(best_cost_option['notes'])
+    notes_str = "; ".join(notes)
 
-    # Best cost unit price with tariff
-    bc_unit  = best_cost_option.get("unit_cost", np.nan) if best_cost_option else np.nan
-    bc_total = best_cost_option.get("cost", np.nan) if best_cost_option else np.nan
-    bc_qty   = best_cost_option.get("actual_order_qty","N/A") if best_cost_option else "N/A"
-    bc_lt    = best_cost_option.get("lead_time", np.inf) if best_cost_option else np.inf
-    bc_src   = best_cost_option.get("source","N/A") if best_cost_option else "N/A"
-
-    desc = (best_cost_option or (all_options[0] if all_options else {})).get("Description","")
-
-    return {
-        "PartNumber":    bom_pn,
-        "Manufacturer":  (best_cost_option or {}).get("Manufacturer", bom_mfg or "N/A"),
-        "MfgPN":         (best_cost_option or {}).get("ManufacturerPartNumber", bom_pn),
-        "QtyNeed":       total_qty_needed,
-        "Status":        status,
-        "Sources":       str(len(valid_options)),
-        "StockAvail":    total_stock,
-        "COO":           consolidated_coo,
-        "TariffPct":     f"{tariff_rate*100:.1f}%",
-        "TariffRate":    tariff_rate,
-        "RiskScore":     risk_score,
-        "RiskFactors":   risk_factors,
-        "BestCostPer":   f"{bc_unit:.4f}" if pd.notna(bc_unit) else "N/A",
-        "BestCostPerRaw": bc_unit,
-        "BestTotalCost": f"{bc_total:.2f}" if pd.notna(bc_total) else "N/A",
-        "BestTotalCostRaw": bc_total,
-        "BestTotalWithTariff": (bc_total * (1 + tariff_rate)) if pd.notna(bc_total) else np.nan,
-        "ActualBuyQty":  str(bc_qty),
-        "BestCostLT":    f"{bc_lt:.0f}" if (pd.notna(bc_lt) and not np.isinf(bc_lt)) else ("0" if total_stock >= total_qty_needed else "N/A"),
-        "BestCostSrc":   bc_src,
-        "Description":   desc,
-        "Notes":         "; ".join(notes_list),
-        "DatasheetUrl":  (best_cost_option or {}).get("DatasheetUrl",""),
-        "_options":      all_options,
-        "_valid":        bool(valid_options),
+    gui_entry = {
+        "PartNumber": bom_part_number,
+        "Manufacturer": consolidated_mfg,
+        "MfgPN": consolidated_mpn,
+        "QtyNeed": total_qty_needed,
+        "Status": status,
+        "Sources": str(len(all_options)),
+        "StockAvail": str(sum(opt.get('stock', 0) for opt in all_options)),
+        "COO": consolidated_coo,
+        "RiskScore": f"{overall_risk:.1f}",
+        "TariffPct": f"{tariff_rate*100:.1f}%" if pd.notna(tariff_rate) else "N/A",
+        "BestCostPer": f"{best_cost_option.get('unit_cost', np.nan):.4f}" if best_cost_option and pd.notna(best_cost_option.get('unit_cost')) else "N/A",
+        "BestTotalCost": f"{best_cost_option.get('cost', np.inf):.2f}" if best_cost_option and best_cost_option.get('cost') != np.inf else "N/A",
+        "ActualBuyQty": str(best_cost_option.get('actual_order_qty', 'N/A')) if best_cost_option else "N/A",
+        "BestCostLT": f"{best_cost_option.get('lead_time', np.inf):.0f}" if best_cost_option and best_cost_option.get('lead_time') != np.inf else "0" if best_cost_option and best_cost_option.get('stock',0) >= total_qty_needed else "N/A",
+        "BestCostSrc": best_cost_option.get('source', "N/A") if best_cost_option else "N/A",
+        "Alternates": "No",  # Alternates not implemented
+        "AlternatesList": [],
+        "Notes": notes_str,
     }
-
-
-def calculate_strategies(part_results, config):
-    """
-    Port of calculate_summary_metrics strategy engine.
-    Returns dict of strategy summaries.
-    """
-    total_units   = config.get("total_units", 100)
-    target_lt     = config.get("target_lead_time_days", 56)
-    max_premium   = config.get("max_premium", 15.0)
-    cost_weight   = config.get("cost_weight", 0.5)
-    lead_weight   = config.get("lead_time_weight", 0.5)
-    buy_up_pct    = config.get("buy_up_threshold", 1.0)
-
-    strategies = {
-        "Lowest Cost (Strict)":      {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
-        "Lowest Cost (In Stock)":    {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
-        "Fastest Lead Time":         {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
-        "Optimized (Cost+LT)":       {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
+    part_summary = {
+        "bom_pn": bom_part_number,
+        "bom_mfg": bom_manufacturer,
+        "original_qty_per_unit": bom_qty_per_unit,
+        "total_qty_needed": total_qty_needed,
+        "options": all_options,
+        "alternates": []
     }
+    return [gui_entry], historical_entries, part_summary
 
-    for part in part_results:
-        if not part.get("_valid"): continue
-        opts        = part["_options"]
-        pn          = part["PartNumber"]
-        qty_needed  = part["QtyNeed"]
-        valid_opts  = [o for o in opts if pd.notna(o.get("cost")) and o.get("cost", np.inf) != np.inf]
-        if not valid_opts: continue
+# --- Predictive functions (Prophet, RAG, AI) adapted ---
+def run_prophet(component_historical_data, metric='Lead_Time_Days', periods=90, min_data_points=5):
+    if component_historical_data is None or component_historical_data.empty:
+        return None
+    if metric not in component_historical_data.columns:
+        return None
+    df = component_historical_data[['Fetch_Timestamp', metric]].dropna()
+    df.rename(columns={'Fetch_Timestamp': 'ds', metric: 'y'}, inplace=True)
+    if len(df) < min_data_points:
+        return None
+    df['ds'] = pd.to_datetime(df['ds'], errors='coerce').dt.tz_localize(None)
+    df['y'] = pd.to_numeric(df['y'], errors='coerce')
+    df = df.dropna()
+    if len(df) < min_data_points:
+        return None
+    # Simple outlier removal
+    q1 = df['y'].quantile(0.25)
+    q3 = df['y'].quantile(0.75)
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    df = df[(df['y'] >= lower) & (df['y'] <= upper)]
+    if len(df) < min_data_points:
+        return None
+    try:
+        with open(os.devnull, 'w') as stderr, contextlib.redirect_stderr(stderr):
+            model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+            model.fit(df)
+        future = model.make_future_dataframe(periods=periods)
+        forecast = model.predict(future)
+        pred = forecast.iloc[-1]['yhat']
+        if metric == 'Lead_Time_Days': pred = max(0, pred)
+        elif metric == 'Cost': pred = max(0.001, pred)
+        return pred
+    except:
+        return None
 
-        # ── Lowest Cost Strict ─────────────────────────────────────────────
-        best = min(valid_opts, key=lambda o: o.get("cost", np.inf))
-        strategies["Lowest Cost (Strict)"]["parts"][pn]  = best
-        strategies["Lowest Cost (Strict)"]["total_cost"] += best.get("cost", 0)
-        lt = best.get("lead_time", 0)
-        if not (isinstance(lt, float) and np.isinf(lt)):
-            strategies["Lowest Cost (Strict)"]["max_lt"] = max(strategies["Lowest Cost (Strict)"]["max_lt"], int(lt or 0))
+def run_rag_mock(prophet_lead, prophet_cost, stock_prob, context=""):
+    rag_lead_range = "N/A"
+    rag_cost_range = "N/A"
+    adj_stock_prob = stock_prob if pd.notna(stock_prob) else 50.0
+    has_issues = "shortage" in context.lower() if context else False
+    if pd.notna(prophet_lead):
+        base = prophet_lead
+        var = max(7, base * 0.15)
+        lead_min = base - var * np.random.uniform(0.5, 1.0)
+        lead_max = base + var * np.random.uniform(1.0, 1.5)
+        if has_issues:
+            lead_min += 7
+            lead_max += 14
+            adj_stock_prob *= 0.8
+        rag_lead_range = f"{max(0, lead_min):.0f}-{max(0, lead_max):.0f}"
+    if pd.notna(prophet_cost):
+        base = prophet_cost
+        var = max(0.01, base * 0.05)
+        cost_min = base - var * np.random.uniform(0.5, 1.0)
+        cost_max = base + var * np.random.uniform(1.0, 1.2)
+        if has_issues:
+            cost_min = max(cost_min, base * 0.98)
+            cost_max += base * 0.1
+        rag_cost_range = f"{max(0.001, cost_min):.3f}-{max(0.001, cost_max):.3f}"
+    return rag_lead_range, rag_cost_range, round(max(0.0, min(100.0, adj_stock_prob)), 1)
 
-        # ── Lowest Cost In-Stock ───────────────────────────────────────────
-        in_stock = [o for o in valid_opts if o.get("stock",0) >= qty_needed]
-        chosen   = min(in_stock, key=lambda o: o.get("cost", np.inf)) if in_stock else best
-        strategies["Lowest Cost (In Stock)"]["parts"][pn]  = chosen
-        strategies["Lowest Cost (In Stock)"]["total_cost"] += chosen.get("cost", 0)
+def run_ai_comparison(prophet_lead, prophet_cost, rag_lead_range, rag_cost_range, stock_prob):
+    ai_lead = prophet_lead if pd.notna(prophet_lead) else np.nan
+    ai_cost = prophet_cost if pd.notna(prophet_cost) else np.nan
+    ai_stock_prob = stock_prob
+    # parse RAG midpoints
+    rag_mid_lead = np.nan
+    rag_mid_cost = np.nan
+    if rag_lead_range != "N/A" and '-' in rag_lead_range:
+        parts = [safe_float(p) for p in rag_lead_range.split('-')]
+        if len(parts) == 2 and not any(pd.isna(p) for p in parts):
+            rag_mid_lead = (parts[0] + parts[1]) / 2.0
+    if rag_cost_range != "N/A" and '-' in rag_cost_range:
+        parts = [safe_float(p) for p in rag_cost_range.split('-')]
+        if len(parts) == 2 and not any(pd.isna(p) for p in parts):
+            rag_mid_cost = (parts[0] + parts[1]) / 2.0
+    # simple weighted average (70% Prophet, 30% RAG)
+    prophet_weight = 0.7
+    rag_weight = 0.3
+    if pd.notna(prophet_lead) and pd.notna(rag_mid_lead):
+        ai_lead = prophet_lead * prophet_weight + rag_mid_lead * rag_weight
+    elif pd.notna(prophet_lead):
+        ai_lead = prophet_lead
+    elif pd.notna(rag_mid_lead):
+        ai_lead = rag_mid_lead
+    if pd.notna(prophet_cost) and pd.notna(rag_mid_cost):
+        ai_cost = prophet_cost * prophet_weight + rag_mid_cost * rag_weight
+    elif pd.notna(prophet_cost):
+        ai_cost = prophet_cost
+    elif pd.notna(rag_mid_cost):
+        ai_cost = rag_mid_cost
+    ai_lead = max(0, ai_lead) if pd.notna(ai_lead) else np.nan
+    ai_cost = max(0.001, ai_cost) if pd.notna(ai_cost) else np.nan
+    return ai_lead, ai_cost, ai_stock_prob
 
-        # ── Fastest Lead Time ──────────────────────────────────────────────
-        def eff_lt(o): return 0 if o.get("stock",0) >= qty_needed else o.get("lead_time", np.inf)
-        fastest = min(valid_opts, key=lambda o: (eff_lt(o), o.get("cost", np.inf)))
-        strategies["Fastest Lead Time"]["parts"][pn]  = fastest
-        strategies["Fastest Lead Time"]["total_cost"] += fastest.get("cost", 0)
-        flt = eff_lt(fastest)
-        if not (isinstance(flt, float) and np.isinf(flt)):
-            strategies["Fastest Lead Time"]["max_lt"] = max(strategies["Fastest Lead Time"]["max_lt"], int(flt or 0))
+# Function to run predictive analysis for all components
+def run_predictive_analysis(historical_df, context=""):
+    if historical_df.empty or 'Component' not in historical_df.columns:
+        return []
+    components = historical_df['Component'].dropna().unique()
+    new_predictions = []
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    for comp in components:
+        comp_data = historical_df[historical_df['Component'] == comp].copy()
+        if comp_data.empty:
+            continue
+        comp_data.sort_values('Fetch_Timestamp', ascending=False, inplace=True)
+        latest_stock_prob = comp_data['Stock_Probability'].iloc[0] if not comp_data.empty and pd.notna(comp_data['Stock_Probability'].iloc[0]) else 50.0
+        prophet_lead = run_prophet(comp_data, 'Lead_Time_Days')
+        prophet_cost = run_prophet(comp_data, 'Cost')
+        rag_lead, rag_cost, rag_stock = run_rag_mock(prophet_lead, prophet_cost, latest_stock_prob, context)
+        ai_lead, ai_cost, ai_stock = run_ai_comparison(prophet_lead, prophet_cost, rag_lead, rag_cost, rag_stock)
+        pred_row = {
+            'Component': comp,
+            'Date': today_str,
+            'Prophet_Lead': f"{prophet_lead:.1f}" if pd.notna(prophet_lead) else '',
+            'Prophet_Cost': f"{prophet_cost:.3f}" if pd.notna(prophet_cost) else '',
+            'RAG_Lead': rag_lead,
+            'RAG_Cost': rag_cost,
+            'AI_Lead': f"{ai_lead:.1f}" if pd.notna(ai_lead) else '',
+            'AI_Cost': f"{ai_cost:.3f}" if pd.notna(ai_cost) else '',
+            'Stock_Probability': f"{ai_stock:.1f}" if pd.notna(ai_stock) else '',
+            'Real_Lead': '', 'Real_Cost': '', 'Real_Stock': '',
+            'Prophet_Ld_Acc': '', 'Prophet_Cost_Acc': '',
+            'RAG_Ld_Acc': '', 'RAG_Cost_Acc': '',
+            'AI_Ld_Acc': '', 'AI_Cost_Acc': '',
+        }
+        new_predictions.append([pred_row.get(h, '') for h in PRED_HEADER])
+    return new_predictions
 
-        # ── Optimized (Cost + Lead Time) ───────────────────────────────────
-        baseline_cost = best.get("cost", np.inf)
-        constrained   = []
-        for o in valid_opts:
-            cost_o    = o.get("cost", np.inf)
-            eff_lt_o  = eff_lt(o)
-            if eff_lt_o == np.inf or eff_lt_o > target_lt: continue
-            if baseline_cost > 1e-9:
-                prem = (cost_o - baseline_cost) / baseline_cost * 100
-            else:
-                prem = 0
-            if prem > max_premium: continue
-            constrained.append(o)
+# --- Streamlit App ---
 
-        if constrained:
-            costs = [safe_float(o.get("cost")) for o in constrained]
-            lts   = [eff_lt(o) for o in constrained if eff_lt(o) != np.inf]
-            min_c = min(costs) if costs else 0; max_c = max(costs) if costs else 1
-            min_l = min(lts)   if lts   else 0; max_l = max(lts)   if lts   else 1
-            c_rng = max(max_c - min_c, 1e-9); l_rng = max(max_l - min_l, 1e-9)
-            best_score = np.inf; opt_chosen = None
-            for o in constrained:
-                nc    = (safe_float(o.get("cost")) - min_c) / c_rng
-                nl    = (eff_lt(o) - min_l) / l_rng if eff_lt(o) != np.inf else 1.0
-                score = cost_weight * nc + lead_weight * nl
-                if o.get("eol") or o.get("discontinued"): score += 0.5
-                if o.get("stock",0) < qty_needed: score += 0.1
-                if score < best_score:
-                    best_score = score; opt_chosen = o
+def main():
+    st.set_page_config(page_title="BOM Analyzer", layout="wide")
+    st.title("NPI BOM Analyzer")
+
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("Configuration")
+        total_units = st.number_input("Total Units to Build", min_value=1, value=100, step=1)
+        max_premium = st.number_input("Max Cost Premium (%)", min_value=0.0, value=15.0, step=1.0, format="%.1f")
+        target_lead_time = st.number_input("Target Lead Time (days)", min_value=0, value=56, step=1)
+        cost_weight = st.slider("Cost Weight (0-1)", 0.0, 1.0, 0.5, step=0.05)
+        lead_time_weight = st.slider("Lead Time Weight (0-1)", 0.0, 1.0, 0.5, step=0.05)
+        buy_up_threshold = st.number_input("Buy-Up Threshold (%)", min_value=0.0, value=1.0, step=0.5, format="%.1f")
+
+        # Custom tariff rates
+        st.subheader("Custom Tariff Rates (%)")
+        tariff_countries = ["China", "Mexico", "India", "Vietnam", "Taiwan", "Japan", "Malaysia", "Germany", "USA", "Philippines", "Thailand", "South Korea"]
+        tariff_rates = {}
+        for country in tariff_countries:
+            rate = st.text_input(f"{country}", value="", key=f"tariff_{country}")
+            if rate:
+                try:
+                    tariff_rates[country] = float(rate) / 100.0
+                except:
+                    st.warning(f"Invalid rate for {country}")
+
+        # API status
+        st.subheader("API Status")
+        for api, enabled in API_KEYS.items():
+            st.write(f"{api}: {'✅' if enabled else '❌'}")
+
+        # File upload
+        st.subheader("BOM Upload")
+        uploaded_file = st.file_uploader("Choose BOM CSV", type=["csv"])
+
+        # Buttons
+        run_analysis = st.button("Run Analysis", type="primary")
+        run_predict = st.button("Run Predictions")
+        run_ai = st.button("AI Summary")
+
+    # Initialize session state
+    if 'bom_df' not in st.session_state:
+        st.session_state.bom_df = None
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+    if 'historical_data_df' not in st.session_state:
+        # Load historical data if exists
+        if HISTORICAL_DATA_FILE.exists():
+            try:
+                st.session_state.historical_data_df = pd.read_csv(HISTORICAL_DATA_FILE)
+            except:
+                st.session_state.historical_data_df = pd.DataFrame(columns=HIST_HEADER)
         else:
-            opt_chosen = fastest  # fallback
+            st.session_state.historical_data_df = pd.DataFrame(columns=HIST_HEADER)
+    if 'predictions_df' not in st.session_state:
+        if PREDICTION_FILE.exists():
+            try:
+                st.session_state.predictions_df = pd.read_csv(PREDICTION_FILE)
+            except:
+                st.session_state.predictions_df = pd.DataFrame(columns=PRED_HEADER)
+        else:
+            st.session_state.predictions_df = pd.DataFrame(columns=PRED_HEADER)
+    if 'strategies_for_export' not in st.session_state:
+        st.session_state.strategies_for_export = {}
+    if 'near_miss_info' not in st.session_state:
+        st.session_state.near_miss_info = {}
 
-        strategies["Optimized (Cost+LT)"]["parts"][pn]  = opt_chosen or best
-        strategies["Optimized (Cost+LT)"]["total_cost"] += (opt_chosen or best).get("cost", 0)
-        olt = eff_lt(opt_chosen or best)
-        if not (isinstance(olt, float) and np.isinf(olt)):
-            strategies["Optimized (Cost+LT)"]["max_lt"] = max(strategies["Optimized (Cost+LT)"]["max_lt"], int(olt or 0))
+    # Load BOM if uploaded
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+            # Basic column mapping (as in original)
+            col_map = {}
+            lower_cols = {c.lower().strip(): c for c in df.columns}
+            if 'part number' in lower_cols:
+                col_map[lower_cols['part number']] = 'Part Number'
+            if 'quantity' in lower_cols or 'qty' in lower_cols:
+                qty_key = 'quantity' if 'quantity' in lower_cols else 'qty'
+                col_map[lower_cols[qty_key]] = 'Quantity'
+            if 'manufacturer' in lower_cols:
+                col_map[lower_cols['manufacturer']] = 'Manufacturer'
+            df.rename(columns=col_map, inplace=True)
+            required = ['Part Number', 'Quantity']
+            if not all(r in df.columns for r in required):
+                st.error("BOM must contain 'Part Number' and 'Quantity' columns.")
+            else:
+                df['Part Number'] = df['Part Number'].astype(str).str.strip()
+                df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0).astype(int)
+                df = df[df['Quantity'] > 0]
+                if 'Manufacturer' not in df.columns:
+                    df['Manufacturer'] = ''
+                st.session_state.bom_df = df
+                st.success(f"BOM loaded: {len(df)} parts")
+        except Exception as e:
+            st.error(f"Error loading BOM: {e}")
 
-    return strategies
+    # Main area tabs
+    tab1, tab2, tab3 = st.tabs(["BOM Analysis", "AI & Predictions", "Visualizations"])
 
+    # Tab 1: BOM Analysis
+    with tab1:
+        if run_analysis and st.session_state.bom_df is not None:
+            config = {
+                'total_units': total_units,
+                'max_premium': max_premium,
+                'target_lead_time_days': target_lead_time,
+                'cost_weight': cost_weight,
+                'lead_time_weight': lead_time_weight,
+                'buy_up_threshold': buy_up_threshold,
+                'custom_tariff_rates': tariff_rates
+            }
+            with st.spinner("Running analysis..."):
+                all_gui_entries = []
+                all_historical = []
+                all_part_summaries = []
+                progress_bar = st.progress(0)
+                total_parts = len(st.session_state.bom_df)
+                for idx, row in st.session_state.bom_df.iterrows():
+                    gui_rows, hist_rows, summary = analyze_single_part(
+                        row['Part Number'], row.get('Manufacturer', ''), row['Quantity'], config
+                    )
+                    all_gui_entries.extend(gui_rows)
+                    all_historical.extend(hist_rows)
+                    if summary.get('options'):
+                        all_part_summaries.append(summary)
+                    progress_bar.progress((idx+1)/total_parts)
+                # Save historical data
+                if all_historical:
+                    append_to_csv(HISTORICAL_DATA_FILE, all_historical)
+                    # Reload historical df
+                    st.session_state.historical_data_df = pd.read_csv(HISTORICAL_DATA_FILE) if HISTORICAL_DATA_FILE.exists() else pd.DataFrame(columns=HIST_HEADER)
+                # Store results
+                st.session_state.analysis_results = {
+                    'gui_entries': all_gui_entries,
+                    'part_summaries': all_part_summaries,
+                    'config': config
+                }
+                # Compute summary metrics (simplified version of original)
+                # For now, just show table
+                st.success("Analysis complete!")
 
-def groq_ai_summary(data_context, groq_key, model):
-    """Call Groq API to generate executive AI summary."""
-    if not groq_key:
-        return "⚠️ Add your free Groq API key in the sidebar to enable AI summaries."
-    system_prompt = ("You are a strategic supply chain advisor specializing in electronic components. "
-                     "Provide concise, actionable insights for executive review. "
-                     "Focus on risk, cost optimization, and build readiness.")
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {groq_key}", "Content-Type":"application/json"},
-            json={"model": model,
-                  "messages":[{"role":"system","content":system_prompt},
-                               {"role":"user","content":data_context}],
-                  "max_tokens": 1200, "temperature": 0.6},
-            timeout=30)
-        result = r.json()
-        if "choices" in result:
-            return result["choices"][0]["message"]["content"].strip()
-        return f"Groq error: {result.get('error',{}).get('message','Unknown')}"
-    except Exception as e:
-        return f"Error calling Groq: {e}"
+        # Display results if available
+        if st.session_state.analysis_results and st.session_state.analysis_results.get('gui_entries'):
+            df_results = pd.DataFrame(st.session_state.analysis_results['gui_entries'])
+            # Apply risk coloring
+            def color_risk(val):
+                try:
+                    score = float(str(val).replace('N/A', '0'))
+                    if score >= RISK_CATEGORIES['high'][0]:
+                        return 'background-color: #fee2e2'
+                    elif score >= RISK_CATEGORIES['moderate'][0]:
+                        return 'background-color: #fef3c7'
+                    else:
+                        return 'background-color: #dcfce7'
+                except:
+                    return ''
+            styled = df_results.style.applymap(color_risk, subset=['RiskScore'])
+            st.dataframe(styled, use_container_width=True, height=400)
 
+            # Summary metrics (placeholder)
+            st.subheader("Summary Metrics")
+            total_cost = df_results['BestTotalCost'].replace('N/A', np.nan).astype(float).sum()
+            max_lt = df_results['BestCostLT'].replace('N/A', np.nan).astype(float).max()
+            st.metric("Total BOM Cost (Optimized)", f"${total_cost:.2f}" if pd.notna(total_cost) else "N/A")
+            st.metric("Max Lead Time", f"{max_lt:.0f} days" if pd.notna(max_lt) else "N/A")
+        else:
+            st.info("Load a BOM and click Run Analysis to see results.")
 
-# ── Streamlit Color Helpers ────────────────────────────────────────────────────
-
-def color_risk_cell(val):
-    if not isinstance(val, (int, float)): return ""
-    if val >= 6.6:   return "background-color:#fee2e2; color:#900"
-    elif val >= 3.6: return "background-color:#fef3c7; color:#7d3f00"
-    return "background-color:#dcfce7; color:#155724"
-
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### 🔬 BOM Analyzer")
-    st.caption("Web Edition v1.0.0 — PCB Department")
-    st.divider()
-
-    st.markdown("**🔑 Supplier API Keys**")
-    mouser_key   = st.text_input("Mouser API Key",      type="password",
-                                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-    nexar_id     = st.text_input("Nexar Client ID",     type="password", placeholder="nexar.com")
-    nexar_secret = st.text_input("Nexar Client Secret", type="password", placeholder="nexar.com")
-
-    st.divider()
-    st.markdown("**🤖 AI Summary (Groq — Free)**")
-    groq_key   = st.text_input("Groq API Key", type="password", placeholder="console.groq.com")
-    groq_model = st.selectbox("Model", [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "mixtral-8x7b-32768",
-    ])
-    st.caption("🔗 [Get free Groq key →](https://console.groq.com)")
-
-    # ── API Status Indicators ─────────────────────────────────────────────
-    st.divider()
-    st.markdown("**📡 API Status**")
-    col_s1, col_s2, col_s3 = st.columns(3)
-    col_s1.markdown("🟢 Mouser" if mouser_key   else "⚫ Mouser")
-    col_s2.markdown("🟢 Nexar"  if (nexar_id and nexar_secret) else "⚫ Nexar")
-    col_s3.markdown("🟢 Groq"   if groq_key     else "⚫ Groq")
-    st.caption("Keys are session-only and never stored.")
-
-    st.divider()
-    st.markdown("**🏗️ Build Configuration**")
-    total_units     = st.number_input("Total Units to Build", min_value=1, value=100, step=10)
-    target_lt_days  = st.number_input("Target Lead Time (days)", min_value=1, value=56, step=7,
-                                       help="Maximum acceptable lead time for Optimized strategy")
-    max_premium_pct = st.number_input("Max Cost Premium % (Optimized)", min_value=0.0, value=15.0, step=1.0,
-                                       help="How much more expensive than cheapest option is acceptable")
-    cost_w  = st.slider("Cost Weight",      0.0, 1.0, 0.50, 0.05)
-    lead_w  = st.slider("Lead Time Weight", 0.0, 1.0, 0.50, 0.05)
-    buy_up  = st.number_input("Buy-Up Threshold %", min_value=0.0, value=1.0, step=0.5,
-                               help="Allow buying to next price break if cost increase is within this %")
-
-    st.divider()
-    st.markdown("**🌍 Custom Tariff Rates (%)**")
-    st.caption("Leave blank to use defaults (China 25%, others 3.5%)")
-    custom_tariffs = {}
-    tariff_countries = ["China","Mexico","India","Vietnam","Taiwan","Japan","Malaysia",
-                        "Germany","USA","Philippines","Thailand","South Korea"]
-    cols_t = st.columns(2)
-    for i, country in enumerate(tariff_countries):
-        with cols_t[i % 2]:
-            rate_str = st.text_input(country, value="", key=f"tariff_{country}", label_visibility="visible")
-            if rate_str.strip():
-                r = safe_float(rate_str)
-                if pd.notna(r) and r >= 0:
-                    custom_tariffs[country] = r / 100.0
-
-config = {
-    "total_units":           total_units,
-    "target_lead_time_days": target_lt_days,
-    "max_premium":           max_premium_pct,
-    "cost_weight":           cost_w,
-    "lead_time_weight":      lead_w,
-    "buy_up_threshold":      buy_up,
-    "custom_tariff_rates":   custom_tariffs,
-}
-
-# ── Main Page ─────────────────────────────────────────────────────────────────
-st.markdown('<div class="title-bar">🔬 BOM Analyzer</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Supply Chain BOM Optimizer · Risk Scoring · AI-Powered Insights (Groq)</div>', unsafe_allow_html=True)
-
-# ── BOM Upload ─────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-head">📂 Step 1 — Upload Your BOM</div>', unsafe_allow_html=True)
-
-col_up, col_tmpl = st.columns([3,1])
-with col_up:
-    uploaded = st.file_uploader("Upload BOM CSV", type=["csv"],
-        help="Must have 'Part Number' and 'Quantity' columns. 'Manufacturer' and 'Description' optional.")
-with col_tmpl:
-    template = pd.DataFrame({
-        "Part Number":  ["LM358DR","RMCF0402FT100K","GRM188R71C104KA01D"],
-        "Quantity":     [2,10,4],
-        "Manufacturer": ["Texas Instruments","Stackpole","Murata"],
-        "Description":  ["Op-Amp Dual","Resistor 100K 0402","Cap 100nF 0402"],
-    })
-    st.download_button("⬇️ BOM Template", template.to_csv(index=False),
-                       "bom_template.csv","text/csv", use_container_width=True)
-
-if uploaded:
-    try:
-        raw_df = pd.read_csv(uploaded, skipinitialspace=True, on_bad_lines='skip')
-        # Collapse any embedded newlines inside fields (common Excel CSV export artifact)
-        raw_df = raw_df.apply(lambda col: col.map(lambda v: str(v).replace("\n"," ").replace("\r","").strip() if isinstance(v, str) else v))
-        raw_df.columns = [c.strip() for c in raw_df.columns]
-
-        # Normalize columns (same logic as source startup guide)
-        col_map = {}
-        for c in raw_df.columns:
-            cl = c.lower().replace(" ","").replace("_","").replace(".","")
-            if cl in ["partnumber","pn","mpn","partno","partnum"]:   col_map[c]="Part Number"
-            elif cl in ["quantity","qty","q","amount","qtyperunit"]: col_map[c]="Quantity"
-            elif cl in ["manufacturer","mfg","mfr"]:                 col_map[c]="Manufacturer"
-            elif cl in ["description","desc","partdescription"]:     col_map[c]="Description"
-        raw_df.rename(columns=col_map, inplace=True)
-
-        if "Part Number" not in raw_df.columns or "Quantity" not in raw_df.columns:
-            st.error("❌ CSV must have 'Part Number' and 'Quantity' columns.")
-            st.stop()
-
-        raw_df["Quantity"]     = pd.to_numeric(raw_df["Quantity"], errors="coerce").fillna(1).astype(int)
-        raw_df["Part Number"]  = raw_df["Part Number"].astype(str).str.strip()
-        raw_df["Manufacturer"] = raw_df.get("Manufacturer", pd.Series([""] * len(raw_df))).fillna("").astype(str)
-        raw_df = raw_df[raw_df["Part Number"].str.len() > 0].dropna(subset=["Part Number"])
-
-        # ── Auto-clean part numbers & report changes ───────────────────────
-        cleaned_log = []
-        def apply_clean(pn):
-            cleaned, original, changes = clean_part_number(pn)
-            if changes:
-                cleaned_log.append({"Original": original, "Cleaned To": cleaned, "Changes": ", ".join(changes)})
-            return cleaned
-        raw_df["Part Number"] = raw_df["Part Number"].apply(apply_clean)
-        if cleaned_log:
-            with st.expander(f"🔧 Auto-cleaned {len(cleaned_log)} part number(s) — click to review", expanded=True):
-                st.caption("These part numbers had formatting issues (apostrophes, suffixes) that were automatically fixed before sending to supplier APIs.")
-                st.dataframe(pd.DataFrame(cleaned_log), use_container_width=True, hide_index=True)
-
-        st.success(f"✅ BOM loaded: **{len(raw_df)} parts**, {raw_df['Quantity'].sum()} total component placements")
-        with st.expander("👁 Preview BOM", expanded=False):
-            st.dataframe(raw_df, use_container_width=True)
-
-        st.divider()
-        st.markdown('<div class="section-head">🚀 Step 2 — Run Analysis</div>', unsafe_allow_html=True)
-
-        if not (mouser_key or (nexar_id and nexar_secret)):
-            st.warning("⚠️ No supplier API keys entered — results will show 'Not Found'. "
-                       "Add Mouser or Nexar keys in the sidebar for live pricing data.")
-
-        run_btn = st.button("▶️ Run BOM Analysis", type="primary", use_container_width=True)
-
-        if run_btn:
-            st.session_state.pop("results", None)
-            st.session_state.pop("strategies", None)
-            st.session_state.pop("ai_summary", None)
-
-            nexar_token_cache = {}
-            results = []
-            progress_bar = st.progress(0, text="Starting analysis...")
-            status_txt   = st.empty()
-            total_parts  = len(raw_df)
-
-            for i, row in raw_df.iterrows():
-                pn   = str(row["Part Number"]).strip()
-                qty  = int(row["Quantity"])
-                mfg  = str(row.get("Manufacturer","")).strip()
-                status_txt.text(f"🔍 {pn}  ({len(results)+1}/{total_parts})")
-                progress_bar.progress((len(results)+1)/total_parts, text=f"Analyzing {pn}…")
-
-                result = analyze_single_part(pn, mfg, qty, config,
-                                             mouser_key, nexar_id, nexar_secret, nexar_token_cache)
-                results.append(result)
-                time.sleep(0.1)  # polite rate-limiting
-
-            progress_bar.empty(); status_txt.empty()
-            st.session_state["results"]    = results
-            st.session_state["strategies"] = calculate_strategies(results, config)
-            st.success(f"✅ Analysis complete — {len(results)} parts processed")
-
-        # ── Results Display ────────────────────────────────────────────────
-        if "results" in st.session_state:
-            results    = st.session_state["results"]
-            strategies = st.session_state["strategies"]
-
-            valid_results = [r for r in results if r.get("_valid")]
-
-            # KPI metrics
-            total_cost_best   = sum(r.get("BestTotalCostRaw", 0) or 0 for r in valid_results)
-            total_cost_tariff = sum(r.get("BestTotalWithTariff", 0) or 0 for r in valid_results)
-            tariff_impact     = total_cost_tariff - total_cost_best
-            high_risk   = sum(1 for r in results if r.get("RiskScore",0) >= 6.6)
-            mod_risk    = sum(1 for r in results if 3.6 <= r.get("RiskScore",0) < 6.6)
-            low_risk    = sum(1 for r in results if r.get("RiskScore",0) < 3.6)
-            eol_count   = sum(1 for r in results if r.get("Status") in ("EOL","Discontinued"))
-            no_stock    = sum(1 for r in results if r.get("StockAvail",0) == 0)
-            not_found   = sum(1 for r in results if not r.get("_valid"))
-
-            st.divider()
-            st.markdown('<div class="section-head">📊 Results</div>', unsafe_allow_html=True)
-
-            k1,k2,k3,k4,k5,k6 = st.columns(6)
-            k1.metric("Total BOM Cost",       f"${total_cost_best:,.2f}")
-            k2.metric("Cost with Tariffs",     f"${total_cost_tariff:,.2f}", delta=f"+${tariff_impact:,.2f}")
-            k3.metric("🔴 High Risk",          high_risk)
-            k4.metric("🟡 Moderate Risk",      mod_risk)
-            k5.metric("🟢 Low Risk",           low_risk)
-            k6.metric("❌ Not Found / EOL",    f"{not_found + eol_count}")
-
-            # ── Not Found Diagnostic ──────────────────────────────────────
-            not_found_parts = [r for r in results if not r.get("_valid")]
-            if not_found_parts:
-                with st.expander(f"⚠️ {len(not_found_parts)} part(s) returned no supplier data — click for guidance", expanded=True):
-                    st.markdown("""
-**Common reasons a part returns no data:**
-- Part number has a distributor suffix (e.g. `2N3906 PBFREE` → try `2N3906`)
-- Part number starts with an apostrophe from Excel export (auto-fixed on next run)
-- Part is too new, too old, or niche for Mouser's catalog
-- Part number belongs to a manufacturer not stocked by Mouser (try Nexar)
-- Mouser daily API limit reached (1,000 calls/day free tier)
-                    """)
-                    nf_rows = [{"Part Number": r["PartNumber"],
-                                "Total Qty Needed": r["QtyNeed"],
-                                "Suggestion": "Try searching manually on mouser.com or digikey.com"
-                                } for r in not_found_parts]
-                    st.dataframe(pd.DataFrame(nf_rows), use_container_width=True, hide_index=True)
-                    st.caption("These parts still appear in the BOM Analysis table with Risk Score = 10 (no data = maximum risk).")
-
-            # Tabs
-            tab1, tab2, tab3, tab4 = st.tabs(["📋 BOM Analysis", "💰 Strategies", "📈 Visualizations", "🤖 AI Summary"])
-
-            # ── Tab 1: Full Results ────────────────────────────────────────
-            with tab1:
-                display_rows = []
-                for r in results:
-                    display_rows.append({
-                        "Part Number":    r["PartNumber"],
-                        "Description":    r.get("Description","")[:60],
-                        "BOM Qty":        r["QtyNeed"] // total_units,
-                        "Total Qty":      r["QtyNeed"],
-                        "Sources":        r["Sources"],
-                        "Best Supplier":  r["BestCostSrc"],
-                        "Unit Cost ($)":  r.get("BestCostPerRaw", np.nan),
-                        "Total Cost ($)": r.get("BestTotalCostRaw", np.nan),
-                        "w/Tariff ($)":   r.get("BestTotalWithTariff", np.nan),
-                        "Tariff":         r["TariffPct"],
-                        "Stock":          r["StockAvail"],
-                        "Lead (days)":    r["BestCostLT"],
-                        "COO":            r["COO"],
-                        "Status":         r["Status"],
-                        "Risk Score":     r["RiskScore"],
-                        "Notes":          r.get("Notes",""),
-                    })
-                res_df = pd.DataFrame(display_rows)
-
-                # Risk filter
-                risk_filter = st.radio("Filter by Risk:", ["All","🔴 High","🟡 Moderate","🟢 Low"],
-                                        horizontal=True, key="risk_filter_tab1")
-                if risk_filter == "🔴 High":
-                    res_df = res_df[res_df["Risk Score"] >= 6.6]
-                elif risk_filter == "🟡 Moderate":
-                    res_df = res_df[(res_df["Risk Score"] >= 3.6) & (res_df["Risk Score"] < 6.6)]
-                elif risk_filter == "🟢 Low":
-                    res_df = res_df[res_df["Risk Score"] < 3.6]
-
-                styled = res_df.style\
-                    .applymap(color_risk_cell, subset=["Risk Score"])\
-                    .format({
-                        "Unit Cost ($)":  lambda v: f"${v:.4f}" if pd.notna(v) else "N/A",
-                        "Total Cost ($)": lambda v: f"${v:,.2f}" if pd.notna(v) else "N/A",
-                        "w/Tariff ($)":   lambda v: f"${v:,.2f}" if pd.notna(v) else "N/A",
-                        "Risk Score":     lambda v: f"{v:.1f}" if pd.notna(v) else "N/A",
-                    })
-                st.dataframe(styled, use_container_width=True, height=500)
-
-                # Risk factor breakdown
-                with st.expander("🔍 Risk Factor Details per Part"):
-                    rf_rows = []
-                    for r in sorted(results, key=lambda x: x.get("RiskScore",0), reverse=True):
-                        rf = r.get("RiskFactors", {})
-                        rf_rows.append({
-                            "Part Number": r["PartNumber"],
-                            "Overall Risk": r["RiskScore"],
-                            "Sourcing":    rf.get("Sourcing",""),
-                            "Stock":       rf.get("Stock",""),
-                            "Lead Time":   rf.get("LeadTime",""),
-                            "Lifecycle":   rf.get("Lifecycle",""),
-                            "Geographic":  rf.get("Geographic",""),
-                            "Status":      r["Status"],
-                            "COO":         r["COO"],
-                        })
-                    rf_df = pd.DataFrame(rf_rows)
-                    st.dataframe(rf_df.style.applymap(color_risk_cell, subset=["Overall Risk"]),
-                                 use_container_width=True)
-
-                # Export
-                export_df = pd.DataFrame([{
-                    "Part Number":    r["PartNumber"],
-                    "Manufacturer":   r["Manufacturer"],
-                    "MfgPN":          r["MfgPN"],
-                    "Description":    r.get("Description",""),
-                    "BOM Qty":        r["QtyNeed"] // total_units,
-                    "Total Qty Needed": r["QtyNeed"],
-                    "Best Supplier":  r["BestCostSrc"],
-                    "Unit Cost ($)":  r.get("BestCostPerRaw",""),
-                    "Total Cost ($)": r.get("BestTotalCostRaw",""),
-                    "Total w/Tariff ($)": r.get("BestTotalWithTariff",""),
-                    "Tariff Rate":    r["TariffPct"],
-                    "Actual Buy Qty": r["ActualBuyQty"],
-                    "Stock Available": r["StockAvail"],
-                    "Lead Time (days)": r["BestCostLT"],
-                    "COO":            r["COO"],
-                    "Status":         r["Status"],
-                    "Risk Score":     r["RiskScore"],
-                    "Sourcing Risk":  r.get("RiskFactors",{}).get("Sourcing",""),
-                    "Stock Risk":     r.get("RiskFactors",{}).get("Stock",""),
-                    "LeadTime Risk":  r.get("RiskFactors",{}).get("LeadTime",""),
-                    "Lifecycle Risk": r.get("RiskFactors",{}).get("Lifecycle",""),
-                    "Geographic Risk": r.get("RiskFactors",{}).get("Geographic",""),
-                    "Datasheet":      r.get("DatasheetUrl",""),
-                    "Notes":          r.get("Notes",""),
-                } for r in results])
-                st.download_button("⬇️ Export Full BOM Analysis CSV",
-                    export_df.to_csv(index=False),
-                    f"BOM_Analysis_{datetime.now():%Y%m%d_%H%M%S}.csv",
-                    "text/csv", use_container_width=True)
-
-            # ── Tab 2: Purchasing Strategies ───────────────────────────────
-            with tab2:
-                st.markdown("Compare the 4 purchasing strategies from the original BOM Analyzer.")
-                strat_summary = []
-                for sname, sdata in strategies.items():
-                    strat_summary.append({
-                        "Strategy":       sname,
-                        "Total BOM Cost": f"${sdata['total_cost']:,.2f}",
-                        "Max Lead Time":  f"{sdata['max_lt']} days",
-                        "Parts Covered":  len(sdata["parts"]),
-                    })
-                st.dataframe(pd.DataFrame(strat_summary), use_container_width=True, hide_index=True)
-
-                chosen_strat = st.selectbox("📋 View / Export Strategy Details:",
-                                            list(strategies.keys()))
-                strat_parts = strategies[chosen_strat]["parts"]
-                strat_rows  = []
-                for pn, opt in strat_parts.items():
-                    lt_val = opt.get("lead_time", np.inf)
-                    lt_str = f"{lt_val:.0f}" if (pd.notna(lt_val) and not np.isinf(lt_val)) else "In Stock / N/A"
-                    strat_rows.append({
-                        "Part Number":   pn,
-                        "Supplier":      opt.get("source","N/A"),
-                        "Unit Cost ($)": opt.get("unit_cost", np.nan),
-                        "Total Cost ($)": opt.get("cost", np.nan),
-                        "Qty Order":     opt.get("actual_order_qty","N/A"),
-                        "Stock":         opt.get("stock",0),
-                        "Lead (days)":   lt_str,
-                        "Notes":         opt.get("notes",""),
-                    })
-                strat_df = pd.DataFrame(strat_rows)
-                st.dataframe(strat_df.style.format({
-                    "Unit Cost ($)":  lambda v: f"${v:.4f}" if pd.notna(v) else "N/A",
-                    "Total Cost ($)": lambda v: f"${v:,.2f}" if pd.notna(v) else "N/A",
-                }), use_container_width=True, height=450)
-
-                strat_export = strat_df.copy()
-                st.download_button(f"⬇️ Export '{chosen_strat}' Strategy CSV",
-                    strat_export.to_csv(index=False),
-                    f"Strategy_{chosen_strat.replace(' ','_')}_{datetime.now():%Y%m%d_%H%M}.csv",
-                    "text/csv", use_container_width=True)
-
-            # ── Tab 3: Visualizations ──────────────────────────────────────
-            with tab3:
-                import matplotlib.pyplot as plt
-
-                chart_type = st.selectbox("Select Chart:", [
-                    "Risk Score Distribution",
-                    "Top Parts by Cost",
-                    "Stock vs Qty Needed",
-                    "Cost + Tariff Impact (Top 15)",
-                    "COO Geographic Risk Map",
-                    "Strategy Cost Comparison",
-                ])
-                fig, ax = plt.subplots(figsize=(11,5))
-                fig.patch.set_facecolor("#f8f9fa"); ax.set_facecolor("#f8f9fa")
-
-                if chart_type == "Risk Score Distribution":
-                    bins   = [0, 3.5, 6.5, 10]
-                    labels = ["🟢 Low (0–3.5)", "🟡 Moderate (3.6–6.5)", "🔴 High (6.6–10)"]
-                    colors = ["#107c10","#ca5010","#d13438"]
-                    counts = [
-                        sum(1 for r in results if r.get("RiskScore",0) <= 3.5),
-                        sum(1 for r in results if 3.5 < r.get("RiskScore",0) <= 6.5),
-                        sum(1 for r in results if r.get("RiskScore",0) > 6.5),
-                    ]
-                    bars = ax.bar(labels, counts, color=colors, width=0.5)
-                    for bar,v in zip(bars,counts):
-                        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.1, str(v),
-                                ha="center", fontweight="bold", fontsize=12)
-                    ax.set_ylabel("Number of Parts"); ax.set_title("Risk Score Distribution")
-
-                elif chart_type == "Top Parts by Cost":
-                    top = sorted(valid_results, key=lambda r: r.get("BestTotalCostRaw",0) or 0, reverse=True)[:20]
-                    ax.barh([r["PartNumber"] for r in top],
-                            [r.get("BestTotalCostRaw",0) or 0 for r in top], color="#0078d4")
-                    ax.set_xlabel("Extended Cost ($)"); ax.set_title("Top 20 Parts by Cost")
-
-                elif chart_type == "Stock vs Qty Needed":
-                    scores  = [r.get("RiskScore",0) for r in results]
-                    x_vals  = [r.get("QtyNeed",0) for r in results]
-                    y_vals  = [r.get("StockAvail",0) for r in results]
-                    sc = ax.scatter(x_vals, y_vals, c=scores, cmap="RdYlGn_r",
-                                   s=80, alpha=0.75, vmin=0, vmax=10)
-                    mx = max(max(x_vals,default=1), max(y_vals,default=1))*1.1
-                    ax.plot([0,mx],[0,mx],"k--",alpha=0.4,label="Stock = Needed")
-                    plt.colorbar(sc, ax=ax, label="Risk Score")
-                    ax.set_xlabel("Qty Needed"); ax.set_ylabel("Stock Available")
-                    ax.set_title("Stock vs Quantity Needed")
-                    ax.legend()
-
-                elif chart_type == "Cost + Tariff Impact (Top 15)":
-                    top = sorted(valid_results, key=lambda r: r.get("BestTotalCostRaw",0) or 0, reverse=True)[:15]
-                    pns  = [r["PartNumber"] for r in top]
-                    base = [r.get("BestTotalCostRaw",0) or 0 for r in top]
-                    tariff_add = [(r.get("BestTotalWithTariff",0) or 0) - (r.get("BestTotalCostRaw",0) or 0) for r in top]
-                    x = range(len(pns))
-                    ax.bar(x, base, label="Base Cost", color="#0078d4")
-                    ax.bar(x, tariff_add, bottom=base, label="Tariff Add-on", color="#d13438", alpha=0.8)
-                    ax.set_xticks(list(x)); ax.set_xticklabels(pns, rotation=45, ha="right", fontsize=8)
-                    ax.set_ylabel("Cost ($)"); ax.set_title("Base Cost vs Tariff Impact")
-                    ax.legend()
-
-                elif chart_type == "COO Geographic Risk Map":
-                    coo_risk = {}
-                    for r in results:
-                        coo = r.get("COO","Unknown")
-                        geo = r.get("RiskFactors",{}).get("Geographic", GEO_RISK_TIERS.get("_DEFAULT_",4))
-                        coo_risk[coo] = max(coo_risk.get(coo,0), geo)
-                    coos  = list(coo_risk.keys())
-                    risks = list(coo_risk.values())
-                    colors= ["#d13438" if v>=7 else "#ca5010" if v>=4 else "#107c10" for v in risks]
-                    ax.barh(coos, risks, color=colors)
-                    ax.set_xlabel("Geographic Risk Score (0-10)")
-                    ax.set_title("Geographic Risk by Country of Origin")
-                    ax.axvline(x=5, color="orange", linestyle="--", alpha=0.6, label="Moderate threshold")
-                    ax.axvline(x=7, color="red",    linestyle="--", alpha=0.6, label="High threshold")
-                    ax.legend(fontsize=8)
-
-                elif chart_type == "Strategy Cost Comparison":
-                    names  = list(strategies.keys())
-                    totals = [strategies[n]["total_cost"] for n in names]
-                    colors = ["#0078d4","#107c10","#ca5010","#d13438"]
-                    bars   = ax.bar(names, totals, color=colors[:len(names)], width=0.5)
-                    for bar, v in zip(bars,totals):
-                        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+5,
-                                f"${v:,.0f}", ha="center", fontsize=9, fontweight="bold")
-                    ax.set_ylabel("Total BOM Cost ($)"); ax.set_title("Purchasing Strategy Cost Comparison")
-                    ax.set_xticklabels(names, rotation=10, ha="right")
-
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close()
-
-            # ── Tab 4: AI Summary ──────────────────────────────────────────
-            with tab4:
-                st.markdown("### 🤖 AI Executive Summary")
-                st.caption(f"Powered by **Groq** — {groq_model} (Free tier)")
-
-                if not groq_key:
-                    st.warning("Add your free Groq API key in the sidebar. "
-                               "Get one at [console.groq.com](https://console.groq.com) — no credit card needed.")
+    # Tab 2: AI & Predictions
+    with tab2:
+        if run_predict and not st.session_state.historical_data_df.empty:
+            with st.spinner("Generating predictions..."):
+                new_predictions = run_predictive_analysis(st.session_state.historical_data_df, context="")
+                if new_predictions:
+                    append_to_csv(PREDICTION_FILE, new_predictions)
+                    st.session_state.predictions_df = pd.read_csv(PREDICTION_FILE) if PREDICTION_FILE.exists() else pd.DataFrame(columns=PRED_HEADER)
+                    st.success("Predictions generated!")
                 else:
-                    # Build a rich prompt context matching original app's AI logic
-                    high_risk_parts = [r for r in results if r.get("RiskScore",0) >= 6.6]
-                    eol_parts       = [r for r in results if r.get("Status") in ("EOL","Discontinued")]
-                    stock_gap_parts = [r for r in results if r.get("StockAvail",0) < r.get("QtyNeed",0)]
-                    no_price_parts  = [r for r in results if not r.get("_valid")]
+                    st.warning("No predictions generated.")
+        # Display predictions
+        if not st.session_state.predictions_df.empty:
+            st.subheader("Predictions vs Actuals")
+            # Allow editing actuals? Use data_editor
+            edited_df = st.data_editor(st.session_state.predictions_df, use_container_width=True, num_rows="dynamic")
+            if st.button("Save Actuals"):
+                # Save back to file
+                edited_df.to_csv(PREDICTION_FILE, index=False)
+                st.session_state.predictions_df = edited_df
+                st.success("Saved!")
+            # Average accuracies
+            st.subheader("Average Prediction Accuracy")
+            models = ["Prophet", "RAG", "AI"]
+            acc_data = []
+            for m in models:
+                ld_col = f"{m}_Ld_Acc"
+                cost_col = f"{m}_Cost_Acc"
+                if ld_col in edited_df.columns:
+                    ld_acc = pd.to_numeric(edited_df[ld_col], errors='coerce').mean()
+                    cost_acc = pd.to_numeric(edited_df[cost_col], errors='coerce').mean()
+                else:
+                    ld_acc = np.nan
+                    cost_acc = np.nan
+                acc_data.append([m, f"{ld_acc:.1f}%" if pd.notna(ld_acc) else "N/A", f"{cost_acc:.1f}%" if pd.notna(cost_acc) else "N/A"])
+            st.table(pd.DataFrame(acc_data, columns=["Model", "Lead Time Acc", "Cost Acc"]))
+        else:
+            st.info("No predictions yet. Run predictions to see data.")
 
-                    critical_detail = ""
-                    for r in high_risk_parts[:8]:
-                        critical_detail += (f"\n  - {r['PartNumber']}: Risk={r['RiskScore']}, "
-                                            f"Stock={r['StockAvail']}/{r['QtyNeed']} needed, "
-                                            f"LT={r['BestCostLT']} days, Status={r['Status']}, COO={r['COO']}")
+        # AI Summary
+        if run_ai:
+            if not openai_client:
+                st.error("OpenAI API key not set.")
+            elif not st.session_state.analysis_results:
+                st.error("Run analysis first.")
+            else:
+                with st.spinner("Generating AI summary..."):
+                    # Build prompt (simplified)
+                    prompt = "Provide a strategic supply chain summary for the following BOM analysis:\n"
+                    gui_entries = st.session_state.analysis_results.get('gui_entries', [])
+                    total_cost = sum(safe_float(e.get('BestTotalCost'), default=0) for e in gui_entries)
+                    prompt += f"Total optimized cost: ${total_cost:.2f}\n"
+                    # Add more details...
+                    prompt += "Recommend the best sourcing strategy."
+                    try:
+                        response = openai_client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=500
+                        )
+                        summary = response.choices[0].message.content
+                        st.markdown(summary)
+                    except Exception as e:
+                        st.error(f"OpenAI error: {e}")
 
-                    strat_summary_text = ""
-                    for sname, sdata in strategies.items():
-                        strat_summary_text += f"\n  - {sname}: ${sdata['total_cost']:,.2f} total, max LT {sdata['max_lt']} days"
+    # Tab 3: Visualizations
+    with tab3:
+        if st.session_state.analysis_results and st.session_state.analysis_results.get('gui_entries'):
+            df_viz = pd.DataFrame(st.session_state.analysis_results['gui_entries'])
+            # Convert numeric columns
+            for col in ['RiskScore', 'BestTotalCost', 'BestCostLT']:
+                df_viz[col] = pd.to_numeric(df_viz[col], errors='coerce')
+            plot_type = st.selectbox("Select Plot", ["Risk Distribution", "Cost Distribution", "Lead Time Distribution", "Cost vs Lead Time"])
+            if plot_type == "Risk Distribution":
+                fig = px.histogram(df_viz, x='RiskScore', nbins=20, title="Risk Score Distribution")
+                st.plotly_chart(fig, use_container_width=True)
+            elif plot_type == "Cost Distribution":
+                fig = px.histogram(df_viz, x='BestTotalCost', nbins=20, title="Cost Distribution")
+                st.plotly_chart(fig, use_container_width=True)
+            elif plot_type == "Lead Time Distribution":
+                fig = px.histogram(df_viz, x='BestCostLT', nbins=20, title="Lead Time Distribution")
+                st.plotly_chart(fig, use_container_width=True)
+            elif plot_type == "Cost vs Lead Time":
+                fig = px.scatter(df_viz, x='BestCostLT', y='BestTotalCost', hover_data=['PartNumber', 'MfgPN'], title="Cost vs Lead Time")
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Run analysis to see visualizations.")
 
-                    prompt = f"""Analyze this BOM for a PCB electronics manufacturing team building {total_units} units.
-
-SUMMARY METRICS:
-- Total Parts: {len(results)}
-- Valid (with pricing): {len(valid_results)}
-- Not Found / No Data: {len(no_price_parts)}
-- Total BOM Cost (best price): ${total_cost_best:,.2f}
-- Total BOM Cost (with tariffs): ${total_cost_tariff:,.2f}
-- Tariff Impact: ${tariff_impact:,.2f}
-- High Risk Parts (≥6.6): {high_risk}
-- Moderate Risk Parts (3.6–6.5): {mod_risk}
-- Low Risk Parts (<3.6): {low_risk}
-- EOL/Discontinued Parts: {eol_count}
-- Parts with Zero Stock: {no_stock}
-- Parts with Stock Gaps: {len(stock_gap_parts)}
-
-PURCHASING STRATEGIES:
-{strat_summary_text}
-
-HIGH RISK PARTS DETAIL (risk ≥6.6):
-{critical_detail if critical_detail else 'None'}
-
-EOL / DISCONTINUED:
-{", ".join(r["PartNumber"] for r in eol_parts[:10]) or "None"}
-
-PARTS WITH STOCK GAPS:
-{", ".join(r["PartNumber"] for r in stock_gap_parts[:10]) or "None"}
-
-Please provide:
-1. **Executive Summary** (2-3 sentences)
-2. **Critical Risks** — specific parts needing immediate attention
-3. **Top 3 Procurement Recommendations** — actionable steps
-4. **Cost Optimization Opportunities**
-5. **Recommended Purchasing Strategy** and why
-
-Be specific, concise, and actionable. Reference actual part numbers where relevant."""
-
-                    if st.button("🤖 Generate AI Summary", type="primary"):
-                        with st.spinner("Groq is analyzing your BOM..."):
-                            summary = groq_ai_summary(prompt, groq_key, groq_model)
-                            st.session_state["ai_summary"] = summary
-
-                    if "ai_summary" in st.session_state:
-                        st.markdown(st.session_state["ai_summary"])
-                        st.download_button("⬇️ Export AI Summary",
-                            st.session_state["ai_summary"],
-                            f"AI_Summary_{datetime.now():%Y%m%d_%H%M%S}.txt",
-                            "text/plain")
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-        import traceback; st.code(traceback.format_exc())
-
-else:
-    # Welcome / instructions
-    st.info("👆 Upload a BOM CSV file above to get started. Download the template if you need the format.")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("""
-**What this tool analyzes:**
-- 📡 Real-time pricing, stock & lead times from **Mouser** and **Nexar/Octopart**
-- 💰 Optimal purchase quantities using **price break + buy-up logic** (exact original algorithm)
-- ⚠️ Multi-factor **risk scoring** (Sourcing, Stock, Lead Time, Lifecycle, Geographic) — same weights as desktop app
-- 🌍 **Tariff/duty estimation** by country of origin
-- 📊 **4 purchasing strategies**: Lowest Cost (Strict), Lowest Cost (In Stock), Fastest, Optimized
-- 🤖 **AI executive summary** via Groq (free, no credit card)
-- 📤 Full **CSV export** for every result and strategy
-        """)
-    with col_b:
-        st.markdown("""
-**CSV Format Required:**
-```
-Part Number, Quantity, Manufacturer, Description
-LM358DR, 2, Texas Instruments, Op-Amp Dual
-RMCF0402FT100K, 10, Stackpole, Resistor 100K
-GRM188R71C104KA01D, 4, Murata, Cap 100nF
-```
-`Part Number` and `Quantity` are required.
-`Manufacturer` and `Description` are optional.
-
-**API Keys Needed (all free):**
-- 🔑 [Mouser API](https://www.mouser.com/api-search/) — mouser.com
-- 🔑 [Nexar API](https://nexar.com) — nexar.com
-- 🤖 [Groq AI](https://console.groq.com) — for AI summary
-        """)
+if __name__ == "__main__":
+    main()
 
 st.divider()
 st.caption("BOM Analyzer Web Edition · CRDV Adaptation Initiative · AI by Groq (free) · For PCB Department use")
