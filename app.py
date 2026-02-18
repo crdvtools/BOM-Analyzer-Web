@@ -1,6 +1,7 @@
 """
 BOM Analyzer Web Edition v1.0.0
 Faithful Streamlit conversion of Tyler Allen's BOM_Analyzer desktop app.
+Component Revision Delta (or Difference) Verification - CRDV
 - Original risk scoring, strategy engine, and buy-up logic preserved exactly
 - OpenAI replaced with Groq (free tier)
 - Tkinter GUI replaced with Streamlit
@@ -217,6 +218,58 @@ def get_tariff_rate(coo, custom_tariffs):
     if "china" in coo_str or "cn" == coo_str: return 0.25
     if "taiwan" in coo_str or "tw" == coo_str: return 0.0
     return 0.035  # WTO baseline
+
+
+# ── Part Number Cleaner ───────────────────────────────────────────────────────
+
+def clean_part_number(pn):
+    """
+    Clean and normalize part numbers before sending to supplier APIs.
+    Handles all patterns found in real-world PCB BOM exports:
+    - Leading apostrophes from Excel  ('9001-12-01 → 9001-12-01)
+    - PBFREE / PB FREE suffix         (2N3906 PBFREE → 2N3906)
+    - Trailing/leading whitespace     (C3216X7R2E104K160AA  → C3216X7R2E104K160AA)
+    - Embedded newlines from CSV      (cleaned at CSV-read stage)
+    - ADI #PBF suffix                 (LTC2057HVHS8#PBF → KEEP as-is, Mouser recognizes it)
+    Returns (cleaned_pn, original_pn, list_of_changes)
+    """
+    original = pn
+    changes  = []
+    p        = str(pn).strip()
+
+    # Remove leading apostrophe/quote (Excel CSV artifact — Excel prepends ' to
+    # prevent numeric interpretation of part numbers like 9001-12-01)
+    if p.startswith(("'", '"', "`")):
+        p = p.lstrip("'\"`")
+        changes.append("removed leading apostrophe (Excel artifact)")
+
+    # Remove PBFREE / PB-FREE / PB FREE suffix (RoHS marker, not part of MPN)
+    # Important: Do NOT strip #PBF from ADI/LTC parts — it IS part of their MPN
+    pbfree_variants = [" PBFREE", "-PBFREE", "_PBFREE", " PB-FREE", "-PB-FREE", " PB FREE"]
+    p_upper = p.upper()
+    for suffix in pbfree_variants:
+        if p_upper.endswith(suffix):
+            p = p[:len(p) - len(suffix)].strip(" -_")
+            changes.append(f"removed '{suffix.strip()}' suffix")
+            break
+
+    # Remove common distributor/packaging suffixes that aren't part of the base MPN
+    # Exception: #PBF is kept because ADI/LTC use it as part of their official MPN
+    dist_suffixes = ["-ND", "-1-ND", "-2-ND", "-TR", "-T&R", "-TRC",
+                     "-CT", "-CUT", "-REEL", "/T", "-T"]
+    p_upper = p.upper()
+    for suffix in dist_suffixes:
+        if p_upper.endswith(suffix.upper()):
+            p = p[:len(p) - len(suffix)].strip(" -_")
+            changes.append(f"removed distributor suffix '{suffix}'")
+            break
+
+    # Final whitespace cleanup
+    p_clean = p.strip()
+    if p_clean != original.strip() and not changes:
+        changes.append("stripped whitespace")
+
+    return p_clean, original, changes
 
 
 # ── API Functions ─────────────────────────────────────────────────────────────
@@ -681,10 +734,10 @@ with st.sidebar:
     st.divider()
 
     st.markdown("**🔑 Supplier API Keys**")
-    mouser_key    = st.text_input("Mouser API Key",        type="password", placeholder="mouser.com/api")
-    nexar_id      = st.text_input("Nexar Client ID",       type="password", placeholder="nexar.com")
-    nexar_secret  = st.text_input("Nexar Client Secret",   type="password", placeholder="nexar.com")
-    st.caption("Keys are session-only and never stored.")
+    mouser_key   = st.text_input("Mouser API Key",      type="password",
+                                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+    nexar_id     = st.text_input("Nexar Client ID",     type="password", placeholder="nexar.com")
+    nexar_secret = st.text_input("Nexar Client Secret", type="password", placeholder="nexar.com")
 
     st.divider()
     st.markdown("**🤖 AI Summary (Groq — Free)**")
@@ -695,6 +748,15 @@ with st.sidebar:
         "mixtral-8x7b-32768",
     ])
     st.caption("🔗 [Get free Groq key →](https://console.groq.com)")
+
+    # ── API Status Indicators ─────────────────────────────────────────────
+    st.divider()
+    st.markdown("**📡 API Status**")
+    col_s1, col_s2, col_s3 = st.columns(3)
+    col_s1.markdown("🟢 Mouser" if mouser_key   else "⚫ Mouser")
+    col_s2.markdown("🟢 Nexar"  if (nexar_id and nexar_secret) else "⚫ Nexar")
+    col_s3.markdown("🟢 Groq"   if groq_key     else "⚫ Groq")
+    st.caption("Keys are session-only and never stored.")
 
     st.divider()
     st.markdown("**🏗️ Build Configuration**")
@@ -756,7 +818,9 @@ with col_tmpl:
 
 if uploaded:
     try:
-        raw_df = pd.read_csv(uploaded)
+        raw_df = pd.read_csv(uploaded, skipinitialspace=True, on_bad_lines='skip')
+        # Collapse any embedded newlines inside fields (common Excel CSV export artifact)
+        raw_df = raw_df.apply(lambda col: col.map(lambda v: str(v).replace("\n"," ").replace("\r","").strip() if isinstance(v, str) else v))
         raw_df.columns = [c.strip() for c in raw_df.columns]
 
         # Normalize columns (same logic as source startup guide)
@@ -777,6 +841,19 @@ if uploaded:
         raw_df["Part Number"]  = raw_df["Part Number"].astype(str).str.strip()
         raw_df["Manufacturer"] = raw_df.get("Manufacturer", pd.Series([""] * len(raw_df))).fillna("").astype(str)
         raw_df = raw_df[raw_df["Part Number"].str.len() > 0].dropna(subset=["Part Number"])
+
+        # ── Auto-clean part numbers & report changes ───────────────────────
+        cleaned_log = []
+        def apply_clean(pn):
+            cleaned, original, changes = clean_part_number(pn)
+            if changes:
+                cleaned_log.append({"Original": original, "Cleaned To": cleaned, "Changes": ", ".join(changes)})
+            return cleaned
+        raw_df["Part Number"] = raw_df["Part Number"].apply(apply_clean)
+        if cleaned_log:
+            with st.expander(f"🔧 Auto-cleaned {len(cleaned_log)} part number(s) — click to review", expanded=True):
+                st.caption("These part numbers had formatting issues (apostrophes, suffixes) that were automatically fixed before sending to supplier APIs.")
+                st.dataframe(pd.DataFrame(cleaned_log), use_container_width=True, hide_index=True)
 
         st.success(f"✅ BOM loaded: **{len(raw_df)} parts**, {raw_df['Quantity'].sum()} total component placements")
         with st.expander("👁 Preview BOM", expanded=False):
@@ -847,6 +924,25 @@ if uploaded:
             k4.metric("🟡 Moderate Risk",      mod_risk)
             k5.metric("🟢 Low Risk",           low_risk)
             k6.metric("❌ Not Found / EOL",    f"{not_found + eol_count}")
+
+            # ── Not Found Diagnostic ──────────────────────────────────────
+            not_found_parts = [r for r in results if not r.get("_valid")]
+            if not_found_parts:
+                with st.expander(f"⚠️ {len(not_found_parts)} part(s) returned no supplier data — click for guidance", expanded=True):
+                    st.markdown("""
+**Common reasons a part returns no data:**
+- Part number has a distributor suffix (e.g. `2N3906 PBFREE` → try `2N3906`)
+- Part number starts with an apostrophe from Excel export (auto-fixed on next run)
+- Part is too new, too old, or niche for Mouser's catalog
+- Part number belongs to a manufacturer not stocked by Mouser (try Nexar)
+- Mouser daily API limit reached (1,000 calls/day free tier)
+                    """)
+                    nf_rows = [{"Part Number": r["PartNumber"],
+                                "Total Qty Needed": r["QtyNeed"],
+                                "Suggestion": "Try searching manually on mouser.com or digikey.com"
+                                } for r in not_found_parts]
+                    st.dataframe(pd.DataFrame(nf_rows), use_container_width=True, hide_index=True)
+                    st.caption("These parts still appear in the BOM Analysis table with Risk Score = 10 (no data = maximum risk).")
 
             # Tabs
             tab1, tab2, tab3, tab4 = st.tabs(["📋 BOM Analysis", "💰 Strategies", "📈 Visualizations", "🤖 AI Summary"])
@@ -1193,4 +1289,4 @@ GRM188R71C104KA01D, 4, Murata, Cap 100nF
         """)
 
 st.divider()
-st.caption("BOM Analyzer Web Edition · Faithful Streamlit port of Tyler Allen's desktop app · AI by Groq (free) · For PCB Department use")
+st.caption("BOM Analyzer Web Edition · CRDV Adaptation Initiative · AI by Groq (free) · For PCB Department use")
